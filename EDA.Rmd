@@ -1,0 +1,1074 @@
+---
+title: "Journal"
+author: "Guanyu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: 
+      latex_engine: xelatex
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r load-lib, include = FALSE}
+library(readr)
+library(sf) # for reading file
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(stringr) # for percentile tranformation
+library(e1071)   # for skewness() and kurtosis()
+library(nortest)   # for Anderson–Darling test
+library(gridExtra)   # for arranging multiple plots together
+library(knitr)      # for kable() pretty tables
+library(kableExtra) # for HTML/PDF styling (optional)
+library(forcats)
+library(ggrepel)
+library(scales)
+library(patchwork)
+library(tidyverse)
+library(reshape2)
+library(viridis)
+library(mclust)
+library(clue)
+source("Proprocessing.R")
+```
+
+# Exploaratory Data Analysis
+
+## Loading data
+
+```{r load-data, message = FALSE}
+# read main data
+simd <- read_csv("simd2020_withgeog/simd2020_withinds.csv")
+
+# read shapefile to acquire geometries
+simd_shp <- st_read("simd2020_withgeog/sc_dz_11.shp")
+
+# merge the files using key "Data_Zone"
+simd_joined <- simd_shp %>%
+  left_join(simd, by = c("DataZone" = "Data_Zone"))
+```
+
+## Visualization over all domains' rank
+
+```{r overall-ranking-plot, fig.width=14, fig.height=10, dpi=300, echo = FALSE}
+# data frame that use to create domain-ranking plots
+simd_domains <- simd_joined %>%
+  select(DataZone,
+         SIMD2020v2_Rank,
+         SIMD2020v2_Income_Domain_Rank,
+         SIMD2020_Employment_Domain_Rank,
+         SIMD2020_Health_Domain_Rank,
+         SIMD2020_Education_Domain_Rank,
+         SIMD2020_Access_Domain_Rank,
+         SIMD2020_Crime_Domain_Rank,
+         SIMD2020_Housing_Domain_Rank,
+         geometry) %>%
+  pivot_longer(
+    cols = starts_with("SIMD2020"),
+    names_to = "Domain",
+    values_to = "Rank"
+  ) %>%
+  mutate(
+    Domain = case_when(
+      grepl("Income", Domain) ~ "Income",
+      grepl("Employment", Domain) ~ "Employment",
+      grepl("Health", Domain) ~ "Health",
+      grepl("Education", Domain) ~ "Education",
+      grepl("Access", Domain) ~ "Access",
+      grepl("Crime", Domain) ~ "Crime",
+      grepl("Housing", Domain) ~ "Housing",
+      grepl("Rank$", Domain) ~ "Overall",
+      TRUE ~ Domain
+    ),
+    Domain = fct_relevel(Domain,
+                         "Overall", "Income", "Employment",
+                         "Health", "Education", "Access",
+                         "Crime", "Housing")
+  )
+
+ggplot(simd_domains) +
+  geom_sf(aes(fill = Rank), colour = NA) +
+  scale_fill_viridis_c(option = "plasma", direction = -1,
+                       name = "Deprivation Rank") +
+  facet_wrap(~ Domain, ncol = 3) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    legend.position = "bottom",
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 12, face = "bold")
+  ) +
+  labs(
+    title = "SIMD 2020v2 Domain Deprivation Ranks Across Scotland",
+    subtitle = "1 = Most Deprived, 6,976 = Least Deprived",
+    caption = "Source: Scottish Government (SIMD 2020v2)"
+  )
+
+```
+
+## Descriptive statistics for all indicators
+
+```{r all-indicators}
+
+indicator_cols <- c(
+  "income_rate", "income_count",
+  "employment_rate", "employment_count",
+  "CIF", "ALCOHOL", "DRUG", "SMR", "DEPRESS",
+  "LBWT", "EMERG", "Attendance", "Attainment",
+  "no_qualifications", "not_participating", "University",
+  "crime_count", "crime_rate", "overcrowded_count",
+  "nocentralheating_count", "overcrowded_rate",
+  "nocentralheating_rate", "drive_petrol", "drive_GP",
+  "drive_post", "drive_primary", "drive_retail",
+  "drive_secondary", "PT_GP", "PT_post", "PT_retail", "broadband"
+)
+
+# Convert percentile to numeric value
+simd_ind <- simd %>%
+  select(any_of(indicator_cols)) %>%
+  mutate(across(where(is.character), ~as.numeric(str_remove(.x, "%"))))
+
+```
+
+
+```{r stattable-for-all, echo = FALSE}
+stats_table <- lapply(simd_ind, describe_var) %>%
+  bind_rows(.id = "Indicator") %>%
+  mutate(
+    across(
+      c(mean, median, sd, skewness, kurtosis),
+      ~round(.x, 2)
+    ), # show statistics in 2 digits
+    p_value = round(p_value, 4)   # show p-value to 4 digits
+  )
+
+stats_table <- stats_table %>%
+  mutate(z_test = ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value)))
+
+kable(stats_table, caption = "Descriptive Statistics and Normality Tests for SIMD Indicators")
+```
+
+```{r density-plots-for-all, fig.width= 10, fig.height=12,, dpi=300, echo = FALSE, warning=FALSE}
+indicator_domains <- tribble(
+  ~Indicator,                ~Domain,
+  # Income
+  "income_rate",             "Income",
+  "income_count",            "Income",
+
+  # Employment
+  "employment_rate",         "Employment",
+  "employment_count",        "Employment",
+
+  # Health
+  "CIF",                     "Health",
+  "ALCOHOL",                 "Health",
+  "DRUG",                    "Health",
+  "SMR",                     "Health",
+  "DEPRESS",                 "Health",
+  "LBWT",                    "Health",
+  "EMERG",                   "Health",
+
+  # Education
+  "Attendance",              "Education",
+  "Attainment",              "Education",
+  "no_qualifications",       "Education",
+  "not_participating",       "Education",
+  "University",              "Education",
+
+  # Access
+  "drive_petrol",            "Access",
+  "drive_GP",                "Access",
+  "drive_post",              "Access",
+  "drive_primary",           "Access",
+  "drive_retail",            "Access",
+  "drive_secondary",         "Access",
+  "PT_GP",                   "Access",
+  "PT_post",                 "Access",
+  "PT_retail",               "Access",
+  "broadband",               "Access",
+
+  # Crime
+  "crime_count",             "Crime",
+  "crime_rate",              "Crime",
+
+  # Housing
+  "overcrowded_count",       "Housing",
+  "nocentralheating_count",  "Housing",
+  "overcrowded_rate",        "Housing",
+  "nocentralheating_rate",   "Housing"
+)
+
+simd_long <- simd_ind %>%
+  pivot_longer(
+    cols = where(is.numeric),
+    names_to = "Indicator",
+    values_to = "Value"
+  ) %>%
+  left_join(indicator_domains, by = "Indicator") %>%
+  filter(!is.na(Domain))
+
+simd_long <- simd_long %>%
+  mutate(
+    # Ensure Domain appears in logical order
+    Domain = fct_relevel(Domain,
+                         "Income", "Employment", "Health",
+                         "Education", "Access", "Crime", "Housing"),
+    # Reorder Indicator factor sequentially by Domain grouping
+    Indicator = factor(Indicator,
+      levels = indicator_domains$Indicator
+    )
+  )
+
+domain_colors <- c(
+  "Income"      = "#1f77b4",  # blue
+  "Employment"  = "#2ca02c",  # green
+  "Health"      = "#d62728",  # red
+  "Education"   = "#9467bd",  # purple
+  "Access"      = "#ff7f0e",  # orange
+  "Crime"       = "#17becf",  # teal
+  "Housing"     = "#8c564b"   # brown
+)
+
+ggplot(simd_long, aes(x = Value, fill = Domain, color = Domain)) +
+  geom_density(linewidth = 0.8, alpha = 0.9) +
+  facet_wrap(~ Indicator, scales = "free", ncol = 4) +
+  scale_fill_manual(values = domain_colors, name = "Domain") +
+  scale_color_manual(values = domain_colors, guide = "none") +
+  theme_minimal(base_size = 12) +
+  theme(
+   strip.text = element_text(size = 11, face = "bold"),
+   axis.title = element_text(size = 12),
+   axis.text.x = element_text(size = 9),
+   axis.text.y = element_text(size = 9),
+   legend.text = element_text(size = 11),
+   legend.title = element_text(size = 12, face = "bold"),
+   panel.spacing = unit(0.8, "lines"),   # extra breathing space between panels
+   plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+   plot.subtitle = element_text(size = 14, hjust = 0.5)
+) +
+  labs(
+    title = "Distribution of SIMD 2020v2 Indicators",
+    subtitle = "Indicators grouped sequentially by domain, with domain-specific colours",
+    caption = "Source: Scottish Government (SIMD 2020v2)"
+  )
+```
+
+# Joint board area
+
+```{r joint-board-map, echo = FALSE, fig.width=10, fig.height=12, dpi=300}
+joint_board_lookup <- tribble(
+  ~Council_area,                          ~Joint_Board_area,
+  "East Ayrshire",                       "Ayrshire",
+  "North Ayrshire",                      "Ayrshire",
+  "South Ayrshire",                      "Ayrshire",
+  "Scottish Borders",                    "Borders",
+  "Clackmannanshire",                    "Central Scotland",
+  "Falkirk",                             "Central Scotland",
+  "Stirling",                            "Central Scotland",
+  "Dumfries and Galloway",               "Dumfries and Galloway",
+  "Argyll and Bute",                     "Dunbartonshire and Argyll & Bute",
+  "East Dunbartonshire",                 "Dunbartonshire and Argyll & Bute",
+  "West Dunbartonshire",                 "Dunbartonshire and Argyll & Bute",
+  "Fife",                                "Fife",
+  "Aberdeen City",                       "Grampian",
+  "Aberdeenshire",                       "Grampian",
+  "Moray",                               "Grampian",
+  "Glasgow City",                        "Glasgow",
+  "Highland",                            "Highlands and Islands",
+  "Na h-Eileanan an Iar",                "Highlands and Islands",
+  "North Lanarkshire",                   "Lanarkshire",
+  "South Lanarkshire",                   "Lanarkshire",
+  "East Lothian",                        "Lothian",
+  "City of Edinburgh",                   "Lothian",
+  "Midlothian",                          "Lothian",
+  "West Lothian",                        "Lothian",
+  "Orkney Islands",                      "Orkney and Shetland",
+  "Shetland Islands",                    "Orkney and Shetland",
+  "East Renfrewshire",                   "Renfrewshire",
+  "Inverclyde",                          "Renfrewshire",
+  "Renfrewshire",                        "Renfrewshire",
+  "Angus",                               "Tayside",
+  "Dundee City",                         "Tayside",
+  "Perth and Kinross",                   "Tayside"
+)
+
+# --- Step 1. Join lookup and count DataZones ---
+simd_joined <- simd_joined %>%
+  left_join(joint_board_lookup, by = c("Council_area" = "Council_area"))
+
+# joint_board_counts <- simd_joined %>%
+#   st_drop_geometry() %>%
+#   group_by(Joint_Board_area) %>%
+#   summarise(n_datazones = n())
+# 
+# # --- Step 2. Build centroids safely (handle invalid geometry) ---
+# joint_board_centroids <- simd_joined %>%
+#   mutate(geometry = st_make_valid(geometry)) %>%
+#   group_by(Joint_Board_area) %>%
+#   summarise(geometry = st_union(geometry)) %>%
+#   st_point_on_surface() %>%
+#   left_join(joint_board_counts, by = "Joint_Board_area")
+# 
+# # --- Step 3. Reproject everything to EPSG:4326 ---
+# simd_joined_4326 <- st_transform(simd_joined, 4326)
+# joint_board_centroids_4326 <- st_transform(joint_board_centroids, 4326)
+# 
+# # --- Step 4. Create legend labels ---
+# simd_joined_4326 <- simd_joined_4326 %>%
+#   left_join(joint_board_counts, by = "Joint_Board_area") %>%
+#   mutate(legend_label = paste0(Joint_Board_area, " (", comma(n_datazones), ")"))
+# 
+# centroid_coords <- st_coordinates(joint_board_centroids_4326) %>%
+#   as.data.frame() %>%
+#   bind_cols(st_drop_geometry(joint_board_centroids_4326))
+# 
+# # --- Step 6. Plot the map ---
+# ggplot(simd_joined_4326) +
+#   geom_sf(aes(fill = legend_label), color = NA) +
+# 
+#   geom_text_repel(
+#     data = centroid_coords,
+#     aes(X, Y, label = paste0(Joint_Board_area, " (", n_datazones, ")")),
+#     fontface = "bold",
+#     color = "black",
+#     size = 3.8,
+#     box.padding = 0.7,
+#     point.padding = 0.5,
+#     segment.color = "grey40",
+#     segment.size = 0.3,
+#     max.overlaps = Inf,
+#     show.legend = FALSE
+#   ) +
+# 
+#   # Legend now only shows area names
+#   scale_fill_viridis_d(option = "turbo", name = "Joint Board Area") +
+# 
+#   guides(fill = guide_legend(nrow = 4, byrow = TRUE)) +  # neatly wrap legend
+#   coord_sf() +
+#   theme_minimal() +
+#   labs(
+#     title = "Scottish Joint Board Areas",
+#   ) +
+#   theme(
+#     plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+#     plot.subtitle = element_text(size = 11, hjust = 0.5),
+#     legend.position = "bottom",
+#     legend.box = "horizontal",
+#     legend.title = element_text(size = 10, face = "bold"),
+#     legend.text = element_text(size = 9),
+#     plot.margin = margin(10, 10, 50, 10)
+#   )
+# 
+# 
+# ```
+# 
+# # Lothian and Glasgow
+# 
+# ## Data Description
+# 
+# ```{r Lothian-stattable, echo = FALSE}
+# simd_ind <- simd_joined %>%
+#   filter(Joint_Board_area == "Lothian") %>%
+#   st_drop_geometry() %>%
+#   select(any_of(indicator_cols)) %>%
+#   mutate(across(where(is.character), ~as.numeric(str_remove(.x, "%"))))
+# 
+# stats_table <- lapply(simd_ind, describe_var) %>%
+#   bind_rows(.id = "Indicator") %>%
+#   mutate(
+#     across(
+#       c(mean, median, sd, skewness, kurtosis),
+#       ~round(.x, 2)
+#     ), # show statistics in 2 digits
+#     p_value = round(p_value, 4)   # show p-value to 4 digits
+#   )
+# 
+# stats_table <- stats_table %>%
+#   mutate(p_value = ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value)))
+# 
+# kable(stats_table, caption = "Descriptive Statistics for Lothian's Indicators")
+# ```
+# 
+# ```{r Lanarkshire-stattable, echo = FALSE}
+# simd_ind <- simd_joined %>%
+#   filter(Joint_Board_area == "Lanarkshire") %>%
+#   st_drop_geometry() %>%
+#   select(any_of(indicator_cols)) %>%
+#   mutate(across(where(is.character), ~as.numeric(str_remove(.x, "%"))))
+# 
+# stats_table <- lapply(simd_ind, describe_var) %>%
+#   bind_rows(.id = "Indicator") %>%
+#   mutate(
+#     across(
+#       c(mean, median, sd, skewness, kurtosis),
+#       ~round(.x, 2)
+#     ), # show statistics in 2 digits
+#     p_value = round(p_value, 4)   # show p-value to 4 digits
+#   )
+# 
+# stats_table <- stats_table %>%
+#   mutate(p_value = ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value)))
+# 
+# kable(stats_table, caption = "Descriptive Statistics for Lanarkshire's Indicators")
+# ```
+# 
+# ```{r Glasgow-stattable, echo = FALSE}
+# simd_ind <- simd_joined %>%
+#   filter(Joint_Board_area == "Glasgow") %>%
+#   st_drop_geometry() %>%
+#   select(any_of(indicator_cols)) %>%
+#   mutate(across(where(is.character), ~as.numeric(str_remove(.x, "%"))))
+# 
+# stats_table <- lapply(simd_ind, describe_var) %>%
+#   bind_rows(.id = "Indicator") %>%
+#   mutate(
+#     across(
+#       c(mean, median, sd, skewness, kurtosis),
+#       ~round(.x, 2)
+#     ), # show statistics in 2 digits
+#     p_value = round(p_value, 4)   # show p-value to 4 digits
+#   )
+# 
+# stats_table <- stats_table %>%
+#   mutate(p_value = ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value)))
+# 
+# kable(stats_table, caption = "Descriptive Statistics for Glasgow's Indicators")
+# ```
+# 
+# ```{r density-plot-lothian-glasgow, fig.width= 10, fig.height=12,, dpi=300, echo = FALSE}
+# library(dplyr)
+# library(tidyr)
+# library(ggplot2)
+# library(forcats)
+# library(stringr)
+# 
+# boards_to_compare <- c("Lothian", "Glasgow","Lanarkshire")
+# 
+# simd_clean <- simd_joined %>%
+#   st_drop_geometry() %>%
+#   mutate(across(any_of(indicator_domains$Indicator),
+#                 ~ as.numeric(str_remove(as.character(.x), "%"))))
+# 
+# #  Filter for selected Joint Board Areas and reshape data
+# simd_compare <- simd_clean %>%
+#   filter(Joint_Board_area %in% boards_to_compare) %>%
+#   select(Joint_Board_area, any_of(indicator_domains$Indicator)) %>%
+#   pivot_longer(
+#     cols = -Joint_Board_area,
+#     names_to = "Indicator",
+#     values_to = "Value"
+#   ) %>%
+#   left_join(indicator_domains, by = "Indicator") %>%
+#   filter(!is.na(Domain)) %>%
+#   mutate(
+#     Joint_Board_area = factor(Joint_Board_area, levels = boards_to_compare),
+#     Domain = fct_relevel(Domain, "Income","Employment","Health",
+#                          "Education","Access","Crime","Housing"),
+#     Indicator = factor(Indicator, levels = indicator_domains$Indicator)
+#   )
+# 
+# # Define colors for the two areas
+# board_colors <- c("Lothian" = "#9467bd", "Glasgow" = "#2ca02c", "Lanarkshire" = "yellow")
+# 
+# # Plot densities side-by-side
+# ggplot(simd_compare, aes(x = Value, fill = Joint_Board_area)) +
+#   geom_density(alpha = 0.5, color = "black", linewidth = 0.3) +
+#   facet_wrap(~ Indicator, scales = "free", ncol = 4) +
+#   scale_fill_manual(values = board_colors, name = "Joint Board Area") +
+#   theme_minimal(base_size = 13) +
+#   theme(
+#     strip.text = element_text(size = 11, face = "bold"),
+#     axis.title = element_blank(),
+#     axis.text.x = element_text(size = 8),
+#     axis.text.y = element_text(size = 8),
+#     legend.title = element_text(size = 11, face = "bold"),
+#     legend.text  = element_text(size = 10),
+#     legend.position = "bottom",
+#     panel.spacing = unit(1, "lines"),
+#     plot.title = element_text(size = 17, face = "bold", hjust = 0.5),
+#     plot.subtitle = element_text(size = 12, hjust = 0.5),
+#     plot.caption = element_text(size = 10, hjust = 1)
+#   ) +
+#   labs(
+#     title = "Comparison of Indicator Distributions between Lothian, Glasgow and Lanarkshire",
+#     subtitle = "Density plots of SIMD 2020v2 indicators for selected Joint Board Areas",
+#     caption = "Source: Scottish Government (SIMD 2020v2)"
+#   )
+# 
+# ```
+# 
+# ```{r deprivation-plot-lothian-glasgow, fig.width= 10, fig.height=12,, dpi=300, echo = FALSE, warning=FALSE}
+# library(ggplot2)
+# library(dplyr)
+# library(sf)
+# library(viridis)
+# library(patchwork)
+# 
+# # --- 1. Count DataZones per Joint Board Area ---
+# area_counts <- simd_joined %>%
+#   st_drop_geometry() %>%
+#   group_by(Joint_Board_area) %>%
+#   summarise(n_datazones = n())
+# 
+# # --- 2. Select target areas ---
+# areas_of_interest <- c("Lothian", "Glasgow", "Lanarkshire")
+# 
+# simd_subset <- simd_joined %>%
+#   filter(Joint_Board_area %in% areas_of_interest) %>%
+#   left_join(area_counts, by = "Joint_Board_area")
+# 
+# # --- 3. Compute within-board deprivation ranks ---
+# simd_subset <- simd_subset %>%
+#   group_by(Joint_Board_area) %>%
+#   mutate(
+#     Local_Rank = rank(SIMD2020v2_Rank, ties.method = "first"),
+#     Local_Rank_Percentile = percent_rank(SIMD2020v2_Rank) * 100
+#   ) %>%
+#   ungroup()
+# 
+# # --- 4. Create Joint Board boundaries for combined map ---
+# joint_board_boundaries <- simd_subset %>%
+#   st_make_valid() %>%
+#   group_by(Joint_Board_area) %>%
+#   summarise(geometry = st_union(geometry)) %>%
+#   ungroup()
+# 
+# # --- 5. Assign distinct colours for borders ---
+# border_colors <- c(
+#   "Glasgow"      = "#1b9e77",
+#   "Lanarkshire"  = "#d95f02",
+#   "Lothian"      = "#7570b3"
+# )
+# 
+# # --- 6. Combined map with distinctive borders ---
+# p_combined <- ggplot(simd_subset) +
+#   geom_sf(aes(fill = SIMD2020v2_Rank), colour = NA) +
+#   geom_sf(data = joint_board_boundaries,
+#           aes(color = Joint_Board_area),
+#           fill = NA, linewidth = 0.8, show.legend = TRUE) +
+#   scale_fill_viridis_c(
+#     option = "plasma",
+#     direction = -1,
+#     name = "Deprivation Rank\n(National)",
+#     na.value = "lightgrey"
+#   ) +
+#   scale_color_manual(
+#     values = border_colors,
+#     name = "Joint Board Area",
+#     guide = guide_legend(override.aes = list(fill = NA, linewidth = 1.5))
+#   ) +
+#   labs(
+#     title = "Combined View with Distinct Joint Board Boundaries",
+#     caption = "Source: Scottish Government (SIMD 2020v2)"
+#   ) +
+#   theme_minimal(base_size = 13) +
+#   theme(
+#     legend.position = "right",
+#     plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+#     plot.subtitle = element_text(size = 12, hjust = 0.5),
+#     axis.text = element_blank(),
+#     axis.ticks = element_blank(),
+#     panel.grid = element_blank()
+#   )
+# 
+# # --- 7. Separate within-area maps (local scales use number of DataZones) ---
+# p_list <- lapply(areas_of_interest, function(area) {
+#   df <- filter(simd_subset, Joint_Board_area == area)
+# 
+#   ggplot(df) +
+#     geom_sf(aes(fill = Local_Rank), color = NA) +
+#     scale_fill_viridis_c(
+#       option = "plasma",
+#       direction = -1,
+#       limits = c(1, max(df$Local_Rank, na.rm = TRUE)),
+#       name = paste0("Deprivation Rank\n(1–", max(df$Local_Rank, na.rm = TRUE), ")"),
+#       na.value = "lightgrey"
+#     ) +
+#     labs(
+#       title = area,
+#       subtitle = paste0("(", unique(df$n_datazones), " DataZones)")
+#     ) +
+#     theme_minimal(base_size = 12) +
+#     theme(
+#       legend.position = "bottom",
+#       legend.title = element_text(face = "bold", size = 10),
+#       legend.text = element_text(size = 9),
+#       axis.text = element_blank(),
+#       axis.ticks = element_blank(),
+#       panel.grid = element_blank(),
+#       plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+#       plot.subtitle = element_text(size = 10, hjust = 0.5)
+#     )
+# })
+# 
+# # --- 8. Arrange the smaller maps neatly ---
+# ## p_list      <- list of the three separate maps (Glasgow, Lanarkshire, Lothian)
+# p_facets <- wrap_plots(p_list, ncol = 3)
+# 
+# # A real separator row (blank plot with title/subtitle)
+# p_sep <- ggplot() +
+#   theme_void() +
+#   labs(title = "Separate View of Each Area",
+#        subtitle = "Within-Area Deprivation Rankings (Independent Colour Scales)") +
+#   theme(
+#     plot.title = element_text(size = 13, face = "bold", hjust = 0.5, margin = margin(b = 2)),
+#     plot.subtitle = element_text(size = 11, hjust = 0.5, margin = margin(t = 0))
+#   )
+# 
+# # Stack: combined map / separator / small maps
+# final_plot <-
+#   (p_combined / p_sep / p_facets) +
+#   plot_layout(heights = c(1, 0.10, 1.3)) &                       # adjust the middle height to taste
+#   plot_annotation(
+#     title = "Deprivation Across Lothian, Glasgow, and Lanarkshire (SIMD 2020v2)",
+#     theme = theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+#   )
+# 
+# final_plot
+# 
+# ```
+# 
+# ```{r correlation-map, fig.width= 10, fig.height=12,, dpi=300, echo = FALSE}
+# library(tidyverse)
+# library(reshape2)
+# library(patchwork)
+# library(viridis)
+# 
+# # --- 0. Define indicator order by domain for readability ---
+indicator_order <- indicator_domains$Indicator
+domain_colors <- c(
+  "Income" = "#1f77b4",
+  "Employment" = "#2ca02c",
+  "Health" = "#d62728",
+  "Education" = "#9467bd",
+  "Access" = "#ff7f0e",
+  "Crime" = "#17becf",
+  "Housing" = "#8c564b"
+)
+
+
+# --- 1. Apply function for both areas ---
+p_lothian <- plot_corr_heatmap(simd_joined, "Lothian")
+p_glasgow <- plot_corr_heatmap(simd_joined, "Glasgow")
+P <- plot_corr_heatmap(simd_joined)
+
+# --- 2. Combine side by side with patchwork ---
+(p_lothian / p_glasgow / P) +
+  plot_annotation(
+    title = "Comparison of Correlation Structures between Lothian and Glasgow",
+    subtitle = "Indicators grouped by domain; values represent Pearson correlation coefficients",
+    theme = theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5)
+    )
+  )
+
+```
+
+# Lothian's Clustering
+
+## Preprocessing
+
+```{r Lothian-Clustering-preprocessing}
+simd_lothian <- simd_joined %>%
+  filter(Joint_Board_area == "Lothian") %>%
+  st_drop_geometry() %>%
+  select(DataZone, all_of(indicator_cols)) %>%
+  # convert only character indicators, never DataZone
+  mutate(across(where(is.character) & !matches("^DataZone$"),
+                ~ as.numeric(str_remove(.x, "%"))))
+
+# display missing values
+
+na_summary <- simd_lothian %>%
+  summarise(across(all_of(intersect(indicator_cols, names(simd_lothian))),
+                   list(Missing_Count = ~ sum(is.na(.)),
+                        Percent_Missing = ~ mean(is.na(.)) * 100),
+                   .names = "{.col}.{.fn}")) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Indicator", ".value"),
+    names_sep = "\\."
+  ) %>%
+  arrange(desc(Missing_Count))
+
+kable(na_summary %>% filter(Missing_Count > 0),
+      digits = 2,
+      caption = "Indicators with Missing Values in Lothian")
+
+lothian_ind <- indicator_cols[indicator_cols != "Attendance"]
+
+simd_lothian <- simd_joined %>%
+  filter(Joint_Board_area == "Lothian") %>%
+  st_drop_geometry() %>%
+  select(DataZone, all_of(lothian_ind)) %>%
+  # convert only character indicators, never DataZone
+  mutate(across(where(is.character) & !matches("^DataZone$"),
+                ~ as.numeric(str_remove(.x, "%")))) %>%
+  # drop rows missing in any indicator (keep DataZone untouched)
+  tidyr::drop_na(all_of(lothian_ind))
+
+lothian_data <- simd_lothian %>%
+    arrange(DataZone)
+
+lothian_data_scaled <- lothian_data %>%
+  mutate(across(all_of(lothian_ind), ~ scale(.)[,1]))
+
+```
+
+```{r lothian-pca, fig.width= 10, fig.height=12, dpi=300}
+library(FactoMineR)
+library(factoextra)
+
+domain_vars <- indicator_domains %>%
+  filter(Indicator %in% colnames(lothian_data)) %>%
+  group_by(Domain) %>%
+  summarise(vars = list(Indicator)) %>%
+  deframe()
+
+# Run PCA for each domain and store the PCA object
+pca_results <- lapply(names(domain_vars), function(domain) {
+  vars <- domain_vars[[domain]]
+  
+  # Keep only variables present in the dataset
+  valid_vars <- intersect(vars, colnames(lothian_data))
+  
+  if (length(valid_vars) == 0) {
+    message(paste("Skipping domain:", domain, "(no valid variables)"))
+    return(NULL)
+  }
+  
+  # --- 1. Run PCA ---
+  pca <- prcomp(lothian_data[, valid_vars, drop = FALSE], scale. = TRUE)
+  
+  # --- 2. Compute variance explained ---
+  var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+  var_df <- tibble(
+    PC = factor(paste0("PC", 1:length(var_explained)), 
+                levels = paste0("PC", 1:length(var_explained))),
+    Variance = var_explained
+  )
+  
+    # --- 3. Create visualization ---
+  plot <- ggplot(var_df, aes(x = PC, y = Variance)) +
+    geom_col(fill = "#4B9CD3") +
+    geom_text(aes(label = sprintf("%.1f%%", Variance * 100)), 
+              vjust = -0.3, size = 3) +
+    labs(
+      title = paste(domain),
+      x = "Principal Component",
+      y = "Proportion of Variance Explained"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+ # Return PCA object and its plot
+  return(list(pca = pca, plot = plot))
+})
+
+# Assign domain names to list elements
+names(pca_results) <- names(domain_vars)
+```
+
+```{r lothian-pc-visuals, fig.width= 10, fig.height=12, dpi=30}
+# Combine all PCA variance plots into a grid
+
+pca_plots <- lapply(pca_results, function(x) x$plot)
+pca_grid <- wrap_plots(pca_plots) +
+  plot_annotation(
+    title = "Domain-wise PCA Results for Lothian Indicators",
+    subtitle = "Each plot shows variance explained by principal components within its domain",
+    theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+  )
+pca_grid
+
+```
+
+```{r lothian-pca-extraction}
+library(purrr)
+library(tibble)
+
+pca_domains <- c("Health", "Education", "Access")
+
+# --- 1. Extract domain-wise PCs explaining 80% cumulative variance ---
+domain_pc_list <- purrr::map(names(pca_results), function(domain) {
+  
+  # Skip domains not in target list
+  if (!(domain %in% pca_domains)) return(NULL)
+  
+  res <- pca_results[[domain]]
+  
+  # Safety checks
+  if (is.null(res) || !"pca" %in% names(res)) return(NULL)
+  pca <- res$pca
+  if (is.null(pca$x)) return(NULL)
+  
+  # Compute variance explained
+  var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+  cum_var <- cumsum(var_explained)
+  
+  # Retain PCs until cumulative variance >= 80%
+  keep_pcs <- which(cum_var >= 0.80)[1]   # first PC index that reaches 80%
+  keep_pcs <- 1:keep_pcs                  # retain all previous ones
+  
+  # Extract retained PC scores
+  pc_data <- as.data.frame(pca$x[, keep_pcs, drop = FALSE])
+  colnames(pc_data) <- paste0(domain, "_PC", keep_pcs)
+  
+  tibble(
+    DataZone = simd_lothian$DataZone[seq_len(nrow(pc_data))],
+    pc_data
+  )
+})
+
+
+# --- 2. Combine domain PC datasets ---
+lothian_pc <- domain_pc_list %>%
+  compact() %>%
+  reduce(full_join, by = "DataZone") %>%
+  drop_na()
+
+simd_lothian <- simd_lothian %>%
+  left_join(lothian_pc)
+
+lothian_scaled <- lothian_data %>%
+  mutate(across(all_of(lothian_ind), scale))
+```
+
+```{r Lothian-Scaled-table}
+stats_table <- lapply(lothian_data %>% select(-DataZone), describe_var) %>%
+  bind_rows(.id = "Indicator") %>%
+  mutate(
+    across(
+      c(mean, median, sd, skewness, kurtosis),
+      ~round(.x, 2)
+    ), # show statistics in 2 digits
+    p_value = round(p_value, 4)   # show p-value to 4 digits
+  )
+stats_table <- stats_table %>%
+  mutate(p_value = ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value)))
+
+kable(stats_table, caption = "Descriptive Statistics and Normality Tests for scaled Lothian's indicators")
+```
+
+```{r Lothian-scaled-visual, fig.width= 10, fig.height=12, dpi=300}
+
+# --- Identify PCA columns automatically ---
+pca_cols <- names(lothian_data)[str_detect(names(lothian_data), "_PC")]
+
+# Create a tibble mapping PCA column names to their domains
+pca_indicators <- tibble(
+  Indicator = pca_cols,
+  Domain = str_extract(pca_cols, "^[A-Za-z]+")  # take the prefix before "_PC"
+)
+
+# Combine raw indicator-domain mapping with PCA mapping
+indicator_domains_expanded <- bind_rows(indicator_domains, pca_indicators)
+
+# Reorder indicators within each domain ---
+indicator_domains_expanded <- indicator_domains_expanded %>%
+  group_by(Domain) %>%
+  arrange(Indicator, .by_group = TRUE) %>%
+  ungroup()
+
+# Ensure domains appear in logical order
+indicator_domains_expanded <- indicator_domains_expanded %>%
+  mutate(
+    Domain = fct_relevel(Domain,
+                         "Income", "Employment", "Health",
+                         "Education", "Access", "Crime", "Housing")
+  )
+
+simd_long <- lothian_data %>%
+  pivot_longer(
+    cols = where(is.numeric),
+    names_to = "Indicator",
+    values_to = "Value"
+  ) %>%
+  left_join(indicator_domains_expanded, by = "Indicator") %>%
+  filter(!is.na(Domain)) %>%
+  mutate(
+    Indicator = factor(
+      Indicator,
+      levels = indicator_domains_expanded$Indicator
+    )
+  )
+
+domain_colors <- c(
+  "Income"      = "#1f77b4",
+  "Employment"  = "#2ca02c",
+  "Health"      = "#d62728",
+  "Education"   = "#9467bd",
+  "Access"      = "#ff7f0e",
+  "Crime"       = "#17becf",
+  "Housing"     = "#8c564b"
+)
+
+ggplot(simd_long, aes(x = Value, fill = Domain, color = Domain)) +
+  geom_density(linewidth = 0.8, alpha = 0.85) +
+  facet_wrap(~ Indicator, scales = "free", ncol = 4) +
+  scale_fill_manual(values = domain_colors, name = "Domain") +
+  scale_color_manual(values = domain_colors, guide = "none") +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(size = 11, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9),
+    legend.text = element_text(size = 11),
+    legend.title = element_text(size = 12, face = "bold"),
+    panel.spacing = unit(0.8, "lines"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5)
+  ) +
+  labs(
+    title = "Distribution of Scaled Lothian's Indicators (Including Domain PCs)",
+    subtitle = "Each facet shows indicator or PCA distribution by domain",
+    caption = "Source: Scottish Government (SIMD 2020v2)"
+  )
+
+```
+
+```{r lothian-Correlation-map,fig.width= 10, fig.height=12, dpi=300}
+# --- 1. Select numeric columns for correlation ---
+lothian_numeric <- lothian_data %>% 
+  select(where(is.numeric))
+
+# --- 2. Compute correlation matrix ---
+corr_matrix <- cor(lothian_numeric, use = "pairwise.complete.obs")
+
+# --- 3. Convert to long format for ggplot ---
+corr_long <- melt(corr_matrix, varnames = c("Var1", "Var2"), value.name = "Correlation")
+
+# --- 4. Create combined indicator-domain mapping (including PCs) ---
+pca_cols <- names(lothian_data)[grepl("_PC", names(lothian_data))]
+pca_indicators <- tibble(
+  Indicator = pca_cols,
+  Domain = stringr::str_extract(pca_cols, "^[A-Za-z]+")
+)
+
+indicator_domains_all <- bind_rows(indicator_domains, pca_indicators) %>%
+  mutate(
+    Domain = fct_relevel(Domain,
+                         "Income", "Employment", "Health", 
+                         "Education", "Access", "Crime", "Housing")
+  )
+
+# --- 5. Apply indicator ordering within domains ---
+ordered_indicators <- indicator_domains_all %>%
+  arrange(Domain, Indicator) %>%
+  pull(Indicator)
+
+ordered_indicators <- intersect(ordered_indicators, colnames(corr_matrix))
+
+corr_long <- corr_long %>%
+  mutate(
+    Var1 = factor(Var1, levels = ordered_indicators),
+    Var2 = factor(Var2, levels = ordered_indicators)
+  )
+
+# --- 6. Plot correlation heatmap ---
+ggplot(corr_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0,
+    name = "Correlation", limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Correlation Heatmap of All Indicators (Including PCA Components)",
+    x = "Indicator",
+    y = "Indicator",
+    caption = "Source: Scottish Government (SIMD 2020v2)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title = element_text(face = "bold"),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(0.5, "lines"),
+    panel.grid = element_blank()
+  )
+```
+
+```{r lothian-pc-correlation, fig.width= 10, fig.height=12, dpi=300}
+pc_data <- lothian_data %>%
+  select(all_of(pca_cols), "income_rate", "employment_rate", "crime_rate", "nocentralheating_rate", "overcrowded_rate"  )
+
+corr_matrix <- cor(pc_data, use = "pairwise.complete.obs")
+
+# --- 3. Convert to long format for ggplot ---
+corr_long <- melt(corr_matrix, varnames = c("Var1", "Var2"), value.name = "Correlation")
+
+# --- 6. Plot correlation heatmap ---
+ggplot(corr_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0,
+    name = "Correlation", limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Correlation Heatmap of Lothian's Main Principal Components ",
+    x = "Indicator",
+    y = "Indicator",
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title = element_text(face = "bold"),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(0.5, "lines"),
+    panel.grid = element_blank()
+  )
+```
+
+
+```{r lothian-raw-correlation, fig.width= 10, fig.height=12, dpi=300}
+raw_ind <- indicator_domains_expanded %>% 
+  filter (Domain %in% c("Health", "Education", "Access")) %>%
+  filter(!Indicator %in% c(pca_cols,"Attendance")) %>%
+  pull(Indicator)
+
+raw_data <- lothian_data %>%
+  select(all_of(raw_ind))
+
+corr_matrix <- cor(raw_data, use = "pairwise.complete.obs")
+
+# --- 3. Convert to long format for ggplot ---
+corr_long <- melt(corr_matrix, varnames = c("Var1", "Var2"), value.name = "Correlation")
+
+# --- 6. Plot correlation heatmap ---
+ggplot(corr_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0,
+    name = "Correlation", limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Correlation Heatmap of Lothian's Raw Indicators ",
+    x = "Indicator",
+    y = "Indicator",
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title = element_text(face = "bold"),
+    legend.key.height = unit(1.2, "lines"),
+    legend.key.width = unit(0.5, "lines"),
+    panel.grid = element_blank()
+  )
+```

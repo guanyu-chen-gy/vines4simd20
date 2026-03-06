@@ -1,0 +1,732 @@
+---
+title: "Copula"
+author: "Guanyu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Raw data
+
+```{r cars}
+library(tidyverse)
+library(sf)
+
+simd <- readr::read_csv("simd2020_withgeog/simd2020_withinds.csv")
+simd_shp <- sf::st_read("simd2020_withgeog/sc_dz_11.shp")
+simd_joined <- simd_shp %>%
+  left_join(simd, by = c("DataZone" = "Data_Zone"))
+joint_board_lookup <- tribble(
+  ~Council_area,                          ~Joint_Board_area,
+  "East Ayrshire",                       "Ayrshire",
+  "North Ayrshire",                      "Ayrshire",
+  "South Ayrshire",                      "Ayrshire",
+  "Scottish Borders",                    "Borders",
+  "Clackmannanshire",                    "Central Scotland",
+  "Falkirk",                             "Central Scotland",
+  "Stirling",                            "Central Scotland",
+  "Dumfries and Galloway",               "Dumfries and Galloway",
+  "Argyll and Bute",                     "Dunbartonshire and Argyll & Bute",
+  "East Dunbartonshire",                 "Dunbartonshire and Argyll & Bute",
+  "West Dunbartonshire",                 "Dunbartonshire and Argyll & Bute",
+  "Fife",                                "Fife",
+  "Aberdeen City",                       "Grampian",
+  "Aberdeenshire",                       "Grampian",
+  "Moray",                               "Grampian",
+  "Glasgow City",                        "Glasgow",
+  "Highland",                            "Highlands and Islands",
+  "Na h-Eileanan an Iar",                "Highlands and Islands",
+  "North Lanarkshire",                   "Lanarkshire",
+  "South Lanarkshire",                   "Lanarkshire",
+  "East Lothian",                        "Lothian",
+  "City of Edinburgh",                   "Lothian",
+  "Midlothian",                          "Lothian",
+  "West Lothian",                        "Lothian",
+  "Orkney Islands",                      "Orkney and Shetland",
+  "Shetland Islands",                    "Orkney and Shetland",
+  "East Renfrewshire",                   "Renfrewshire",
+  "Inverclyde",                          "Renfrewshire",
+  "Renfrewshire",                        "Renfrewshire",
+  "Angus",                               "Tayside",
+  "Dundee City",                         "Tayside",
+  "Perth and Kinross",                   "Tayside"
+)
+
+simd_joined <- simd_joined %>%
+  left_join(joint_board_lookup, by = c("Council_area" = "Council_area"))
+
+# Pull out Lothian data
+
+indicator_cols <- c(
+"income_rate", "income_count",
+"employment_rate", "employment_count",
+"CIF", "ALCOHOL", "DRUG", "SMR", "DEPRESS",
+"LBWT", "EMERG", "Attendance", "Attainment",
+"no_qualifications", "not_participating", "University",
+"crime_count", "crime_rate",
+"overcrowded_count", "nocentralheating_count",
+"overcrowded_rate", "nocentralheating_rate",
+"drive_petrol", "drive_GP", "drive_post",
+"drive_primary", "drive_retail", "drive_secondary",
+"PT_GP", "PT_post", "PT_retail", "broadband"
+)
+
+simd_lothian_raw <- simd_joined %>%
+  filter(Joint_Board_area == "Lothian") %>%
+  st_drop_geometry() %>%
+  select(DataZone, any_of(indicator_cols)) %>%
+  mutate(
+    across(
+      where(is.character) & !matches("^DataZone$"), 
+      ~ as.numeric(str_remove(.x, "%"))
+      )
+    )
+
+na_summary <- simd_lothian_raw %>%
+  summarise(
+    across(
+      all_of(indicator_cols),
+      list(
+        Missing_Count   = ~ sum(is.na(.)),
+        Percent_Missing = ~ mean(is.na(.)) * 100
+        ),
+      .names = "{.col}.{.fn}")
+    ) %>%
+  pivot_longer(
+    everything(),
+    names_to  = c("Indicator", ".value"),
+    names_sep = "\\.") %>%
+  arrange(desc(Missing_Count))
+
+
+lothian_ind <- na_summary %>%
+  filter(Percent_Missing <= 10) %>%
+  pull(Indicator)
+
+simd_lothian <- simd_lothian_raw %>%
+  select(DataZone, all_of(lothian_ind)) %>%
+  drop_na(all_of(lothian_ind))
+
+# Standardize for PCA & clustering
+
+lothian_data <- simd_lothian %>%
+  select(-DataZone) %>%
+  scale() %>%
+  as.data.frame()
+
+# Domain Mapping
+
+indicator_domains <- tribble(
+  ~Indicator,                ~Domain,
+  # Income
+  "income_rate",             "Income",
+  "income_count",            "Income",
+
+  # Employment
+  "employment_rate",         "Employment",
+  "employment_count",        "Employment",
+
+  # Health
+  "CIF",                     "Health",
+  "ALCOHOL",                 "Health",
+  "DRUG",                    "Health",
+  "SMR",                     "Health",
+  "DEPRESS",                 "Health",
+  "LBWT",                    "Health",
+  "EMERG",                   "Health",
+
+  # Education
+  "Attendance",              "Education",
+  "Attainment",              "Education",
+  "no_qualifications",       "Education",
+  "not_participating",       "Education",
+  "University",              "Education",
+
+  # Access
+  "drive_petrol",            "Access",
+  "drive_GP",                "Access",
+  "drive_post",              "Access",
+  "drive_primary",           "Access",
+  "drive_retail",            "Access",
+  "drive_secondary",         "Access",
+  "PT_GP",                   "Access",
+  "PT_post",                 "Access",
+  "PT_retail",               "Access",
+  "broadband",               "Access",
+
+  # Crime
+  "crime_count",             "Crime",
+  "crime_rate",              "Crime",
+
+  # Housing
+  "overcrowded_count",       "Housing",
+  "nocentralheating_count",  "Housing",
+  "overcrowded_rate",        "Housing",
+  "nocentralheating_rate",   "Housing"
+)
+
+domain_vars <- indicator_domains %>%
+  filter(Indicator %in% colnames(lothian_data)) %>%
+  group_by(Domain) %>%
+  summarise(vars = list(Indicator)) %>%
+  deframe()
+
+
+raw_ind <- indicator_domains %>%
+  filter(Domain %in% c("Health", "Education", "Access")) %>%
+  filter(!Indicator %in% c("Attendance")) %>%
+  pull(Indicator)
+
+rate_ind <- c("income_rate", "employment_rate", "crime_rate",
+         "nocentralheating_rate", "overcrowded_rate")
+
+raw_data <- lothian_data %>% select(all_of(c(raw_ind,rate_ind)))
+```
+
+```{r}
+set.seed(123)
+k <- 2
+k_raw <- kmeans(raw_data, centers = k, nstart = 25)
+lothian_data <- raw_data %>%
+  mutate(
+    cluster_k = k_raw$cluster
+  )
+```
+
+## R-vine
+```{r, fig.width=14, fig.height=6, echo=FALSE, message=FALSE, warning=FALSE}
+library(rvinecopulib)
+library(ggraph)
+
+# independence test 
+
+X <- lothian_data %>%
+  select(where(is.numeric)) %>%
+  select(-any_of("cluster_k")) %>%
+  as.data.frame() # Keeps only the variables
+
+X <- X %>% drop_na()
+
+U <- pseudo_obs(as.matrix(X))
+
+fit <- vinecop(
+  data = U,
+  family_set = "parametric",  # search common parametric families
+  selcrit = "bic",            # penalizes complexity more than AIC
+  tree_crit = "tau",          # dependence measure for structure selection
+  trunc_lvl = Inf,            # fit all trees
+  cores = 4                   # parallelize if possible
+)
+
+fit
+summary(fit)
+plot(fit)
+
+logLik(fit)
+AIC(fit)
+BIC(fit)
+
+```
+
+```{r}
+fit_cluster_vines <- function(df, cluster_col = "cluster_k", cores = 4) {
+  clusters <- sort(unique(df[[cluster_col]]))
+
+  res <- lapply(clusters, function(k) {
+    Xk <- df %>%
+      filter(.data[[cluster_col]] == k) %>%
+      select(where(is.numeric)) %>%
+      select(-any_of(cluster_col)) %>%
+      drop_na() %>%
+      as.data.frame()
+
+    Uk <- pseudo_obs(as.matrix(Xk))
+
+    fitk <- vinecop(
+      data = Uk,
+      family_set = "parametric",
+      selcrit = "bic",
+      tree_crit = "tau",
+      trunc_lvl = Inf,
+      cores = cores
+    )
+
+    list(k = k, X = Xk, U = Uk, fit = fitk)
+  })
+
+  names(res) <- paste0("cluster_", clusters)
+  res
+}
+
+fits <- fit_cluster_vines(lothian_data, cores = 4)
+
+edge_table <- function(fit) {
+  sm <- summary(fit)  # data-frame-like
+
+  vn <- attr(sm, "var_names")
+  if (is.null(vn) || length(vn) == 0) vn <- paste0("V", seq_len(ncol(fit$data)))
+
+  sm$var1 <- vn[sapply(sm$conditioned, `[[`, 1)]
+  sm$var2 <- vn[sapply(sm$conditioned, `[[`, 2)]
+
+  sm$cond_set <- sapply(sm$conditioning, function(idx) {
+    idx <- idx[idx != 0]
+    if (length(idx) == 0) "" else paste(vn[idx], collapse = ", ")
+  })
+
+  sm
+}
+
+edges_by_cluster <- lapply(fits, function(obj) edge_table(obj$fit))
+
+edges_all <- bind_rows(lapply(names(edges_by_cluster), function(nm) {
+  df <- edges_by_cluster[[nm]]
+  df %>%
+    mutate(
+      cluster = nm,
+      pair = paste(var1, var2, sep = " — "),
+      abs_tau = abs(tau)
+    )
+}))
+
+top_tree1 <- edges_all %>% filter(tree == 1) %>%
+  group_by(cluster) %>% slice_max(abs_tau, n = 12, with_ties = FALSE) %>%
+  ungroup()
+
+ggplot(top_tree1, aes(x = abs_tau, y = reorder(pair, abs_tau))) +
+  geom_col() +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(x = "|Kendall's tau| (Tree 1)", y = NULL)
+```
+
+```{r, fig.width=14, fig.height=6, echo=FALSE, message=FALSE, warning=FALSE}
+library(patchwork)
+
+fit1 <- fits[["cluster_1"]]$fit
+fit2 <- fits[["cluster_2"]]$fit
+
+p1 <- plot(fit1, tree = 1, edge_labels = "tau") +
+  ggplot2::ggtitle("Cluster 1 — Tree 1")
+
+p2 <- plot(fit2, tree = 1, var_names = "legend", edge_labels = "tau") +
+  ggplot2::ggtitle("Cluster 2 — Tree 1")
+
+p1 | p2
+
+```
+
+```{r, fig.width=12, fig.height= 7.8, dpi=300}
+# ============================================================
+# Chunk: rvinecopulib cluster-wise RVine + CVine + readable plots
+# (replaces the old VineCopula::RVineStructureSelect workflow)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rvinecopulib)
+  library(patchwork)
+  library(ggplot2)
+  library(ggraph)   # required by plot.vinecop()
+})
+
+# ----------------------------
+# 0) Helpers
+# ----------------------------
+
+make_U <- function(X) {
+  U <- rvinecopulib::pseudo_obs(as.matrix(X))
+  colnames(U) <- colnames(X)
+  U
+}
+
+get_cluster_X <- function(df, k, cluster_col = "cluster_k") {
+  df %>%
+    dplyr::filter(.data[[cluster_col]] == k) %>%
+    dplyr::select(where(is.numeric)) %>%
+    dplyr::select(-any_of(cluster_col)) %>%
+    tidyr::drop_na() %>%
+    as.data.frame()
+}
+
+# Choose a C-vine order by "overall dependence":
+# same spirit as common C-vine heuristics (sum of |Kendall tau| per variable).
+cvine_order_from_tau <- function(U) {
+  tau_mat <- stats::cor(U, method = "kendall", use = "pairwise.complete.obs")
+  score <- colSums(abs(tau_mat), na.rm = TRUE)
+  order(score, decreasing = TRUE)
+}
+
+fit_one_cluster_rvinecopulib <- function(df, k,
+                                         cluster_col = "cluster_k",
+                                         type = c("RVine", "CVine"),
+                                         family_set = "parametric",
+                                         selcrit = "bic",
+                                         tree_crit = "tau",
+                                         trunc_lvl = Inf,
+                                         threshold = 0,
+                                         cores = 4,
+                                         cvine_order = NULL) {
+  type <- match.arg(type)
+
+  Xk <- get_cluster_X(df, k, cluster_col = cluster_col)
+  Uk <- make_U(Xk)
+
+  if (type == "RVine") {
+    vc <- rvinecopulib::vinecop(
+      data = Uk,
+      family_set = family_set,
+      structure = NA,      # automatic (regular) vine structure selection
+      selcrit = selcrit,
+      tree_crit = tree_crit,
+      trunc_lvl = trunc_lvl,
+      threshold = threshold,
+      cores = cores
+    )
+    list(cluster = k, X = Xk, U = Uk, fit = vc, type = "RVine")
+  } else {
+    if (is.null(cvine_order)) cvine_order <- cvine_order_from_tau(Uk)
+    cv_struct <- rvinecopulib::cvine_structure(cvine_order)
+
+    vc <- rvinecopulib::vinecop(
+      data = Uk,
+      family_set = family_set,
+      structure = cv_struct,  # fixed C-vine structure
+      selcrit = selcrit,
+      tree_crit = tree_crit,
+      trunc_lvl = trunc_lvl,
+      threshold = threshold,
+      cores = cores
+    )
+    list(cluster = k, X = Xk, U = Uk, fit = vc, type = "CVine",
+         cvine_order = cvine_order, structure = cv_struct)
+  }
+}
+
+fit_clusterwise_vines <- function(df,
+                                  cluster_col = "cluster_k",
+                                  clusters = NULL,
+                                  type = c("RVine", "CVine"),
+                                  family_set = "parametric",
+                                  selcrit = "bic",
+                                  tree_crit = "tau",
+                                  trunc_lvl = Inf,
+                                  threshold = 0,
+                                  cores = 4) {
+  type <- match.arg(type)
+  if (is.null(clusters)) clusters <- sort(unique(df[[cluster_col]]))
+
+  fits <- purrr::map(clusters, ~ fit_one_cluster_rvinecopulib(
+    df = df, k = .x, cluster_col = cluster_col,
+    type = type,
+    family_set = family_set,
+    selcrit = selcrit,
+    tree_crit = tree_crit,
+    trunc_lvl = trunc_lvl,
+    threshold = threshold,
+    cores = cores
+  ))
+
+  names(fits) <- paste0("cluster_", clusters)
+  fits
+}
+
+# ----------------------------
+# 1) Fit RVine and CVine (rvinecopulib)
+# ----------------------------
+
+fits_rvine <- fit_clusterwise_vines(
+  df = lothian_data,
+  cluster_col = "cluster_k",
+  type = "RVine",
+  family_set = "parametric",
+  selcrit = "bic",
+  tree_crit = "tau",
+  trunc_lvl = Inf,
+  threshold = 0,
+  cores = 4
+)
+
+fits_cvine <- fit_clusterwise_vines(
+  df = lothian_data,
+  cluster_col = "cluster_k",
+  type = "CVine",
+  family_set = "parametric",
+  selcrit = "bic",
+  tree_crit = "tau",
+  trunc_lvl = Inf,
+  threshold = 0,
+  cores = 4
+)
+
+# ----------------------------
+# 2) Readable side-by-side plots
+# ----------------------------
+# Notes:
+# - plot.vinecop() returns a ggraph/ggplot object, so patchwork works.
+# - edge_labels options: "family", "tau", "family_tau", "pair"
+# - var_names = "legend" uses node numbers in the graph and prints a legend mapping
+#   numbers -> variables (this replaces the old custom NO-key you built).
+
+plot_tree_side_by_side <- function(fits, tree = 1, main_prefix = "",
+                                   edge_label = c("tau", "family_tau", "family", "pair", "auto", "tau+cond_no")) {
+  edge_label <- match.arg(edge_label)
+  # "tau+cond_no" was a custom label in your old VineCopula plotting code.
+  # plot.vinecop() does not support it directly, so we fall back to "tau".
+  if (edge_label == "tau+cond_no") edge_label <- "tau"
+  if (edge_label == "auto") edge_label <- if (tree == 1) "tau" else "family_tau"
+
+  fit1 <- fits[["cluster_1"]]$fit
+  fit2 <- fits[["cluster_2"]]$fit
+
+  p1 <- plot(fit1, tree = tree, var_names = "legend", edge_labels = edge_label) +
+    ggtitle(paste0(main_prefix, "Cluster 1 — Tree ", tree))
+
+  p2 <- plot(fit2, tree = tree, var_names = "legend", edge_labels = edge_label) +
+    ggtitle(paste0(main_prefix, "Cluster 2 — Tree ", tree))
+
+  (p1 | p2) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+}
+
+# ======================
+# Example usage:
+# ======================
+plot_tree_side_by_side(fits_rvine, tree = 1, main_prefix = "RVine | ", edge_label = "tau")
+plot_tree_side_by_side(fits_rvine, tree = 2, main_prefix = "RVine | ", edge_label = "family_tau")
+plot_tree_side_by_side(fits_cvine, tree = 1, main_prefix = "CVine | ", edge_label = "tau")
+plot_tree_side_by_side(fits_cvine, tree = 2, main_prefix = "CVine | ", edge_label = "family_tau")
+```
+
+```{r}
+# =========================================
+# Accurate bar charts: Cluster 1, Cluster 2, and Difference
+# (robust to cluster naming and A-B vs B-A duplicates)
+# =========================================
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+# Canonicalise pair key so A—B and B—A are identical
+canon_pair <- function(a, b, sep = " — ") {
+  ifelse(a <= b, paste(a, b, sep = sep), paste(b, a, sep = sep))
+}
+
+# Normalise cluster labels to C1/C2 (robust)
+norm_cluster <- function(x) {
+  x0 <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    x0 %in% c("cluster_1", "cluster 1", "c1", "1") ~ "C1",
+    x0 %in% c("cluster_2", "cluster 2", "c2", "2") ~ "C2",
+    TRUE ~ x  # fallback (shouldn't happen)
+  )
+}
+
+# Build clean edge table for a given tree
+
+extract_tree_edges <- function(vine, tree = 1, var_names = NULL) {
+  if (is.null(vine)) stop("`vine` is NULL. Did you pass obj$fit?")
+  sm <- summary(vine)
+
+  if (is.null(var_names)) {
+    if (!is.null(vine$names)) var_names <- vine$names
+    else var_names <- as.character(seq_len(dim(vine)[1]))
+  }
+
+  idx_to_name <- function(idx) {
+    idx <- as.integer(idx)
+    if (length(idx) == 0 || is.na(idx)) return(NA_character_)
+    if (idx >= 1 && idx <= length(var_names)) return(var_names[idx])
+    as.character(idx)
+  }
+
+  sm %>%
+    dplyr::filter(.data$tree == tree) %>%
+    dplyr::mutate(
+      var1 = vapply(.data$conditioned, function(z) idx_to_name(z[1]), character(1)),
+      var2 = vapply(.data$conditioned, function(z) idx_to_name(z[2]), character(1)),
+      cond_set = vapply(.data$conditioning, function(z) {
+        z <- z[!is.na(z) & z != 0]
+        if (length(z) == 0) "" else paste(vapply(z, idx_to_name, character(1)), collapse = ", ")
+      }, character(1)),
+      abs_tau = abs(.data$tau)
+    ) %>%
+    dplyr::select(var1, var2, cond_set, tau = .data$tau, abs_tau)
+}
+
+
+build_tree_edges <- function(fits, tree = 1, wrap_width = 42) {
+  purrr::imap_dfr(fits, function(obj, nm) {
+    extract_tree_edges(obj$fit, tree = tree, var_names = obj$fit$names) %>%
+      mutate(cluster_raw = nm)
+  }) %>%
+    mutate(
+      cluster = norm_cluster(cluster_raw),
+      pair_key = canon_pair(var1, var2),
+      pair_lab = str_wrap(pair_key, width = wrap_width)
+    ) %>%
+    select(cluster, pair_key, pair_lab, tau, abs_tau) %>%
+    distinct()
+}
+
+# Plot top-n for ONE cluster (separate chart)
+plot_top_abs_tau_cluster <- function(edges, cluster = "C1",
+                                     n = 12, title = NULL, digits = 2) {
+  lab <- ifelse(cluster == "C1", "Cluster 1", "Cluster 2")
+
+  df <- edges %>%
+    filter(cluster == !!cluster) %>%
+    # in case the same pair appears twice, keep the max |tau|
+    group_by(pair_key, pair_lab) %>%
+    summarise(
+      tau = tau[which.max(abs_tau)],
+      abs_tau = max(abs_tau),
+      .groups = "drop"
+    ) %>%
+    slice_max(abs_tau, n = n, with_ties = FALSE) %>%
+    arrange(abs_tau) %>%
+    mutate(pair_lab = factor(pair_lab, levels = pair_lab))
+
+  ggplot(df, aes(x = abs_tau, y = pair_lab)) +
+    geom_col() +
+    geom_text(aes(label = formatC(tau, format = "f", digits = digits)),
+              hjust = -0.10, size = 3) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+    labs(
+      x = "|Kendall's tau|",
+      y = NULL,
+      title = title %||% paste0(lab, ": Top ", n, " edges by |tau|")
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          axis.text.y = element_text(size = 9))
+}
+
+# Plot difference chart: Δ|tau| = |tau|_C2 - |tau|_C1
+plot_top_abs_tau_absdiff <- function(edges, n = 12, title = NULL, digits = 2, wrap_width = 34) {
+
+  wide <- edges %>%
+    dplyr::select(cluster, pair_key, pair_lab, abs_tau) %>%
+    dplyr::distinct() %>%
+    tidyr::pivot_wider(
+      names_from  = cluster,
+      values_from = abs_tau,
+      values_fill = 0,
+      names_prefix = "abs_tau_"
+    )
+
+  # safety: if any column is absent, create it as 0
+  if (!"abs_tau_C1" %in% names(wide)) wide$abs_tau_C1 <- 0
+  if (!"abs_tau_C2" %in% names(wide)) wide$abs_tau_C2 <- 0
+
+  wide <- wide %>%
+    dplyr::mutate(
+      absdiff  = abs(abs_tau_C2 - abs_tau_C1),
+      pair_lab = stringr::str_wrap(pair_lab, width = wrap_width),
+      lab      = formatC(absdiff, format = "f", digits = digits)
+    ) %>%
+    dplyr::slice_max(absdiff, n = n, with_ties = FALSE) %>%
+    dplyr::arrange(absdiff) %>%
+    dplyr::mutate(pair_lab = factor(pair_lab, levels = pair_lab))
+
+  ggplot2::ggplot(wide, ggplot2::aes(x = absdiff, y = pair_lab)) +
+    ggplot2::geom_col(width = 0.70) +
+    ggplot2::geom_text(ggplot2::aes(label = lab), hjust = -0.10, size = 3) +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.18))) +
+    ggplot2::labs(
+      x = expression("|Δ| = ||tau|[C2] - |tau|[C1]|"),
+      y = NULL,
+      title = title %||% paste0("Top ", n, " edges by |Δ| in |tau|")
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold"),
+      axis.text.y = ggplot2::element_text(size = 9)
+    )
+}
+
+
+
+
+# -------------------------
+# Example usage:
+tree_edges <- build_tree_edges(fits_rvine, tree = 1)
+
+p_c1 <- plot_top_abs_tau_cluster(tree_edges, cluster = "C1", n = 12, title = "RVine: Cluster 1 (Tree 1)")
+p_c2 <- plot_top_abs_tau_cluster(tree_edges, cluster = "C2", n = 12, title = "RVine: Cluster 2 (Tree 1)")
+p_absdiff <- plot_top_abs_tau_absdiff(tree_edges, n = 12, title = "RVine: |Δ| (Tree 1)")
+
+p_c1
+p_c2
+p_absdiff
+```
+```{r}
+# =========================================
+# CVine vs RVine comparison by cluster using logLik / AIC / BIC (rvinecopulib)
+# Requires: fits_rvine, fits_cvine created earlier (each element has $U and $fit)
+# =========================================
+
+library(dplyr)
+library(purrr)
+library(tibble)
+library(knitr)
+
+# One row (cluster, model) -> nobs, npar, logLik, AIC, BIC
+ic_one <- function(obj, model_name) {
+  U  <- obj$U
+  vc <- obj$fit
+
+  ll_obj <- logLik(vc)
+  ll <- as.numeric(ll_obj)
+
+  # number of parameters: prefer df attribute from logLik(); fall back to vc$npars if needed
+  k <- attr(ll_obj, "df")
+  if (is.null(k) && !is.null(vc$npars)) k <- vc$npars
+
+  n <- nrow(U)
+
+  tibble(
+    model = model_name,
+    nobs  = n,
+    npar  = as.numeric(k),
+    logLik = ll,
+    AIC = as.numeric(AIC(vc)),
+    BIC = as.numeric(BIC(vc))
+  )
+}
+
+# Build table (same format as before, but computed from rvinecopulib objects)
+ic_tbl <- bind_rows(
+  imap_dfr(fits_cvine, ~ ic_one(.x, "CVine") %>% mutate(cluster = .y)),
+  imap_dfr(fits_rvine, ~ ic_one(.x, "RVine") %>% mutate(cluster = .y))
+) %>%
+  mutate(
+    cluster = gsub("^cluster_", "Cluster ", cluster),
+    logLik = round(logLik, 2),
+    AIC    = round(AIC, 2),
+    BIC    = round(BIC, 2),
+    npar   = as.integer(round(npar))
+  ) %>%
+  select(cluster, model, nobs, npar, logLik, AIC, BIC) %>%
+  arrange(cluster, model)
+
+kable(ic_tbl, caption = "CVine vs RVine comparison by cluster (logLik/AIC/BIC)")
+
+# Optional: a compact “difference” table (negative means CVine is better = smaller)
+ic_diff <- ic_tbl %>%
+  tidyr::pivot_wider(names_from = model, values_from = c(logLik, AIC, BIC, npar)) %>%
+  mutate(
+    d_logLik = logLik_CVine - logLik_RVine,
+    d_AIC    = AIC_CVine    - AIC_RVine,
+    d_BIC    = BIC_CVine    - BIC_RVine
+  ) %>%
+  select(cluster, d_logLik, d_AIC, d_BIC)
+
+kable(ic_diff, caption = "CVine − RVine differences (negative AIC/BIC => CVine preferred)")
+```
