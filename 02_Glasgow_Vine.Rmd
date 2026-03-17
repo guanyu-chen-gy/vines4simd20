@@ -1,0 +1,1249 @@
+---
+title: "Cluster-specific vine-copula modelling (Glasgow)"
+author: "Guanyu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  output_dir: "outputs/glasgow"
+  vine_dataset: "raw"
+  cluster_column: "raw_kmeans_k2"
+  cmeans_membership_source: !r NULL
+  core_threshold_candidates: !r c(0.8, 0.7, 0.6)
+  core_min_complete_n: 50
+  vine_cores: 4
+  selectioncrit: "BIC"
+  treecrit: "tau"
+  indeptest: true
+  indep_level: 0.05
+  trunclevel: !r NA
+  familyset: !r NA
+  compare_trees: !r 1:2
+  node_label: "NO"
+  condition_label: "NO"
+  min_abs_tau: 0.00
+  digits: 2
+  seed: 123
+  main_model_type: "RVine"
+---
+
+# Overview
+
+This document:
+
+1. fits **CVine** and **RVine** models within each cluster,
+2. compares the two vine types in each cluster using **logLik, AIC, and BIC**,
+3. treats **RVine** as the main model for interpretation,
+4. compares **RVine Tree 1** and **RVine Tree 2** across the two clusters using:
+   - individual tree plots,
+   - an individual-tree table for cluster 1,
+   - an individual-tree table for cluster 2,
+   - a comparison table across clusters,
+5. adds a **core-member robustness check** using the exported **reference C-means membership file**, choosing the strictest practical threshold from a candidate set,
+6. only reports **core-only vine fits** when both clusters retain enough complete observations at the chosen threshold,
+7. provides **CVine tree plots in the appendix**.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%",
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+```{r packages, include=FALSE}
+required_pkgs <- c(
+  "tidyverse",
+  "VineCopula",
+  "igraph",
+  "ggplot2",
+  "grid",
+  "knitr",
+  "kableExtra"
+)
+missing_pkgs <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  stop("Install these packages before knitting: ", paste(missing_pkgs, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(VineCopula)
+  library(igraph)
+  library(ggplot2)
+  library(grid)
+  library(knitr)
+  library(kableExtra)
+})
+set.seed(params$seed)
+```
+
+# Helper functions
+
+```{r helpers, include=FALSE}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+assert_file_exists <- function(path) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  invisible(path)
+}
+
+read_analysis_inputs <- function(output_dir) {
+  base_path <- file.path(output_dir, "glasgow_analysis_base.csv")
+  raw_path <- file.path(output_dir, "glasgow_feature_set_raw.csv")
+  pc_path <- file.path(output_dir, "glasgow_feature_set_pc.csv")
+  cluster_path <- file.path(output_dir, "glasgow_cluster_assignments.csv")
+  cmeans_raw_path <- file.path(output_dir, "glasgow_cmeans_memberships_raw.csv")
+  cmeans_pc_path <- file.path(output_dir, "glasgow_cmeans_memberships_pc.csv")
+  purrr::walk(c(base_path, raw_path, pc_path, cluster_path), assert_file_exists)
+
+  maybe_read_csv <- function(path) {
+    if (!file.exists(path)) return(NULL)
+    readr::read_csv(path, show_col_types = FALSE)
+  }
+
+  list(
+    base = readr::read_csv(base_path, show_col_types = FALSE),
+    raw = readr::read_csv(raw_path, show_col_types = FALSE),
+    pc = readr::read_csv(pc_path, show_col_types = FALSE),
+    clusters = readr::read_csv(cluster_path, show_col_types = FALSE),
+    cmeans_raw = maybe_read_csv(cmeans_raw_path),
+    cmeans_pc = maybe_read_csv(cmeans_pc_path)
+  )
+}
+
+make_U <- function(X) {
+  U <- VineCopula::pobs(as.matrix(X))
+  colnames(U) <- colnames(X)
+  U
+}
+
+as_rvine_matrix <- function(x) {
+  if (inherits(x, "RVineMatrix")) return(x)
+  if (is.list(x) && !is.null(x$RVM) && inherits(x$RVM, "RVineMatrix")) return(x$RVM)
+  stop("`x` must be an `RVineMatrix` or a list containing `$RVM`.")
+}
+
+safe_cores <- function(x) {
+  out <- suppressWarnings(as.integer(x[[1]]))
+  if (length(out) == 0 || is.na(out) || out < 1) return(1L)
+  out
+}
+
+is_informative_numeric <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 2) return(FALSE)
+  stats::sd(x) > 0 && dplyr::n_distinct(x) > 1
+}
+
+prepare_cluster_matrix <- function(df,
+                                   cluster_value,
+                                   cluster_col = "cluster",
+                                   feature_cols = NULL) {
+  dat <- df %>% filter(.data[[cluster_col]] == cluster_value)
+
+  if (is.null(feature_cols)) {
+    feature_cols <- setdiff(names(dat), c("DataZone", cluster_col, "max_membership"))
+  }
+  feature_cols <- intersect(feature_cols, names(dat))
+
+  Xk <- dat %>%
+    select(any_of(feature_cols)) %>%
+    select(where(is.numeric)) %>%
+    drop_na() %>%
+    as.data.frame()
+
+  if (ncol(Xk) == 0) {
+    return(list(
+      X = Xk,
+      n_complete = nrow(Xk),
+      d_complete = ncol(Xk),
+      dropped_constant = character(),
+      kept_features = character()
+    ))
+  }
+
+  informative <- vapply(Xk, is_informative_numeric, logical(1))
+  dropped_constant <- names(Xk)[!informative]
+  Xk <- Xk[, informative, drop = FALSE]
+
+  list(
+    X = Xk,
+    n_complete = nrow(Xk),
+    d_complete = ncol(Xk),
+    dropped_constant = dropped_constant,
+    kept_features = names(Xk)
+  )
+}
+
+fit_one_cluster_vine <- function(df,
+                                 cluster_value,
+                                 cluster_col = "cluster",
+                                 feature_cols = NULL,
+                                 type = c("RVine", "CVine"),
+                                 selectioncrit = "BIC",
+                                 treecrit = "tau",
+                                 familyset = NA,
+                                 trunclevel = NA,
+                                 indeptest = TRUE,
+                                 level = 0.05,
+                                 cores = 4,
+                                 progress = FALSE) {
+  type <- match.arg(type)
+  prep <- prepare_cluster_matrix(
+    df = df,
+    cluster_value = cluster_value,
+    cluster_col = cluster_col,
+    feature_cols = feature_cols
+  )
+  Xk <- prep$X
+
+  if (prep$n_complete < 5) {
+    stop("Cluster ", cluster_value, " has too few complete observations after filtering (n=", prep$n_complete, ").")
+  }
+  if (prep$d_complete < 2) {
+    stop("Cluster ", cluster_value, " has too few informative variables for vine fitting (d=", prep$d_complete, ").")
+  }
+
+  Uk <- make_U(Xk)
+
+  fit_once <- function(cores_use) {
+    VineCopula::RVineStructureSelect(
+      data = Uk,
+      familyset = familyset,
+      type = type,
+      selectioncrit = selectioncrit,
+      indeptest = indeptest,
+      level = level,
+      trunclevel = trunclevel,
+      treecrit = treecrit,
+      cores = cores_use,
+      progress = progress
+    )
+  }
+
+  requested_cores <- safe_cores(cores)
+  fit_try <- tryCatch(fit_once(requested_cores), error = function(e) e)
+  if (inherits(fit_try, "error") && requested_cores > 1L) {
+    fit_try <- tryCatch(fit_once(1L), error = function(e) e)
+  }
+  if (inherits(fit_try, "error")) {
+    stop(
+      "Cluster ", cluster_value, " ", type,
+      " fit failed after preprocessing: ",
+      conditionMessage(fit_try)
+    )
+  }
+
+  RVM <- fit_try
+  RVM$names <- colnames(Uk)
+  list(
+    cluster = cluster_value,
+    type = type,
+    X = Xk,
+    U = Uk,
+    RVM = RVM,
+    dropped_constant = prep$dropped_constant
+  )
+}
+
+fit_clusterwise_vines <- function(df,
+                                  cluster_col = "cluster",
+                                  feature_cols = NULL,
+                                  type = c("RVine", "CVine"),
+                                  selectioncrit = "BIC",
+                                  treecrit = "tau",
+                                  familyset = NA,
+                                  trunclevel = NA,
+                                  indeptest = TRUE,
+                                  level = 0.05,
+                                  cores = 4) {
+  type <- match.arg(type)
+  clusters <- sort(unique(df[[cluster_col]]))
+  clusters <- clusters[!is.na(clusters)]
+  fits <- purrr::map(clusters, ~ fit_one_cluster_vine(
+    df = df,
+    cluster_value = .x,
+    cluster_col = cluster_col,
+    feature_cols = feature_cols,
+    type = type,
+    selectioncrit = selectioncrit,
+    treecrit = treecrit,
+    familyset = familyset,
+    trunclevel = trunclevel,
+    indeptest = indeptest,
+    level = level,
+    cores = cores
+  ))
+  names(fits) <- paste0("cluster_", clusters)
+  fits
+}
+
+fit_vine_suite <- function(df, cluster_col = "cluster", feature_cols = NULL) {
+  list(
+    CVine = fit_clusterwise_vines(
+      df = df,
+      cluster_col = cluster_col,
+      feature_cols = feature_cols,
+      type = "CVine",
+      selectioncrit = params$selectioncrit,
+      treecrit = params$treecrit,
+      familyset = params$familyset,
+      trunclevel = params$trunclevel,
+      indeptest = params$indeptest,
+      level = params$indep_level,
+      cores = params$vine_cores
+    ),
+    RVine = fit_clusterwise_vines(
+      df = df,
+      cluster_col = cluster_col,
+      feature_cols = feature_cols,
+      type = "RVine",
+      selectioncrit = params$selectioncrit,
+      treecrit = params$treecrit,
+      familyset = params$familyset,
+      trunclevel = params$trunclevel,
+      indeptest = params$indeptest,
+      level = params$indep_level,
+      cores = params$vine_cores
+    )
+  )
+}
+
+summarise_fit_eligibility <- function(df,
+                                      cluster_col = "cluster",
+                                      feature_cols = NULL,
+                                      min_n = 5) {
+  if (!(cluster_col %in% names(df))) {
+    return(tibble(
+      cluster = numeric(),
+      n_complete = integer(),
+      d_complete = integer(),
+      dropped_constant = character(),
+      eligible_for_vine = logical(),
+      fit_status = character()
+    ))
+  }
+
+  clusters <- sort(unique(df[[cluster_col]]))
+  clusters <- clusters[!is.na(clusters)]
+
+  if (length(clusters) == 0) {
+    return(tibble(
+      cluster = numeric(),
+      n_complete = integer(),
+      d_complete = integer(),
+      dropped_constant = character(),
+      eligible_for_vine = logical(),
+      fit_status = character()
+    ))
+  }
+
+  purrr::map_dfr(clusters, function(cl) {
+    prep <- prepare_cluster_matrix(
+      df = df,
+      cluster_value = cl,
+      cluster_col = cluster_col,
+      feature_cols = feature_cols
+    )
+
+    eligible <- prep$n_complete >= min_n && prep$d_complete >= 2
+    reason <- dplyr::case_when(
+      prep$n_complete < min_n ~ paste0("too few complete observations (n=", prep$n_complete, ")"),
+      prep$d_complete < 2 ~ paste0("too few informative variables after filtering (d=", prep$d_complete, ")"),
+      TRUE ~ "eligible"
+    )
+
+    tibble(
+      cluster = cl,
+      n_complete = prep$n_complete,
+      d_complete = prep$d_complete,
+      dropped_constant = if (length(prep$dropped_constant) == 0) "" else paste(prep$dropped_constant, collapse = ", "),
+      eligible_for_vine = eligible,
+      fit_status = reason
+    )
+  })
+}
+
+detect_cmeans_membership_source <- function(vine_dataset,
+                                           cluster_column,
+                                           requested_source = NULL) {
+  if (!is.null(requested_source) && !is.na(requested_source) && nzchar(requested_source)) {
+    return(requested_source)
+  }
+  if (!is.null(vine_dataset) && vine_dataset %in% c("raw", "pc")) {
+    return(vine_dataset)
+  }
+  if (grepl("^raw_", cluster_column)) return("raw")
+  if (grepl("^pc_", cluster_column)) return("pc")
+  NULL
+}
+
+get_cmeans_membership_tbl <- function(inputs, source = NULL) {
+  if (is.null(source) || is.na(source) || !nzchar(source)) return(NULL)
+  switch(
+    source,
+    raw = inputs$cmeans_raw,
+    pc = inputs$cmeans_pc,
+    stop("Unknown C-means membership source: ", source)
+  )
+}
+
+summarise_core_filter <- function(all_df, core_df, cluster_col = "cluster") {
+  all_counts <- all_df %>%
+    count(.data[[cluster_col]], name = "n_all") %>%
+    rename(cluster = .data[[cluster_col]])
+
+  core_counts <- core_df %>%
+    count(.data[[cluster_col]], name = "n_core") %>%
+    rename(cluster = .data[[cluster_col]])
+
+  all_counts %>%
+    full_join(core_counts, by = "cluster") %>%
+    mutate(
+      n_all = replace_na(n_all, 0L),
+      n_core = replace_na(n_core, 0L),
+      retained_pct = if_else(n_all > 0, n_core / n_all, NA_real_)
+    ) %>%
+    arrange(cluster)
+}
+
+safe_num <- function(x) {
+  if (length(x) == 0 || is.null(x) || all(is.na(x))) return(NA_real_)
+  as.numeric(x[1])
+}
+
+
+coerce_threshold_candidates <- function(x) {
+  out <- suppressWarnings(as.numeric(x))
+  out <- out[is.finite(out)]
+  out <- unique(out)
+  out <- out[out >= 0 & out <= 1]
+  sort(out, decreasing = TRUE)
+}
+
+summarise_core_threshold_candidates <- function(all_df,
+                                                thresholds,
+                                                cluster_col = "cluster",
+                                                feature_cols = NULL,
+                                                min_n = 50) {
+  clusters_all <- sort(unique(all_df[[cluster_col]]))
+  clusters_all <- clusters_all[!is.na(clusters_all)]
+
+  purrr::map_dfr(thresholds, function(thr) {
+    core_df <- all_df %>%
+      filter(!is.na(max_membership) & max_membership >= thr)
+
+    counts_tbl <- summarise_core_filter(all_df, core_df, cluster_col = cluster_col)
+    elig_tbl <- summarise_fit_eligibility(
+      core_df,
+      cluster_col = cluster_col,
+      feature_cols = feature_cols,
+      min_n = min_n
+    )
+
+    counts_tbl %>%
+      full_join(elig_tbl, by = "cluster") %>%
+      complete(cluster = clusters_all) %>%
+      mutate(
+        threshold = thr,
+        n_all = replace_na(n_all, 0L),
+        n_core = replace_na(n_core, 0L),
+        retained_pct = if_else(n_all > 0, n_core / n_all, NA_real_),
+        n_complete = replace_na(n_complete, 0L),
+        d_complete = replace_na(d_complete, 0L),
+        dropped_constant = replace_na(dropped_constant, ""),
+        eligible_for_vine = replace_na(eligible_for_vine, FALSE),
+        fit_status = replace_na(fit_status, paste0("too few complete observations (n=0; need at least ", min_n, ")"))
+      ) %>%
+      arrange(cluster)
+  })
+}
+
+choose_core_threshold <- function(threshold_summary) {
+  if (nrow(threshold_summary) == 0) return(NA_real_)
+
+  threshold_status <- threshold_summary %>%
+    group_by(threshold) %>%
+    summarise(
+      all_clusters_eligible = all(eligible_for_vine),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(threshold))
+
+  chosen <- threshold_status %>%
+    filter(all_clusters_eligible) %>%
+    slice_head(n = 1) %>%
+    pull(threshold)
+
+  if (length(chosen) == 0) NA_real_ else chosen[[1]]
+}
+
+summarise_vine_fits <- function(fit_list) {
+  if (length(fit_list) == 0) {
+    return(tibble(
+      type = character(),
+      cluster = integer(),
+      n = integer(),
+      d = integer(),
+      logLik = double(),
+      AIC = double(),
+      BIC = double()
+    ))
+  }
+
+  purrr::imap_dfr(fit_list, function(obj, nm) {
+    cluster_guess <- suppressWarnings(as.integer(gsub("^cluster_", "", nm)))
+    ll <- safe_num(obj$RVM$logLik)
+    if (is.na(ll)) ll <- tryCatch({
+      out <- VineCopula::RVineLogLik(obj$U, obj$RVM)
+      if (length(out) > 1) sum(out, na.rm = TRUE) else safe_num(out)
+    }, error = function(e) NA_real_)
+    aic <- safe_num(obj$RVM$AIC)
+    if (is.na(aic) && !is.na(ll)) aic <- -2 * ll + 2 * sum(!is.na(obj$RVM$family))
+    bic <- safe_num(obj$RVM$BIC)
+    if (is.na(bic) && !is.na(ll)) bic <- -2 * ll + log(nrow(obj$U)) * sum(!is.na(obj$RVM$family))
+    tibble(
+      type = obj$type %||% NA_character_,
+      cluster = obj$cluster %||% cluster_guess,
+      n = nrow(obj$U),
+      d = ncol(obj$U),
+      logLik = ll,
+      AIC = aic,
+      BIC = bic
+    )
+  })
+}
+
+select_best_type_by_cluster <- function(fit_summary, metric = c("BIC", "AIC", "logLik")) {
+  metric <- match.arg(metric)
+  if (nrow(fit_summary) == 0) {
+    return(fit_summary %>% mutate(selected = logical()))
+  }
+  fit_summary %>%
+    group_by(cluster) %>%
+    arrange(
+      if (metric == "logLik") desc(.data[[metric]]) else .data[[metric]],
+      BIC, AIC, desc(logLik),
+      .by_group = TRUE
+    ) %>%
+    mutate(selected = row_number() == 1L) %>%
+    ungroup()
+}
+
+format_cond_label <- function(cond_idx, var_names, mode = c("NO", "name")) {
+  mode <- match.arg(mode)
+  idx <- cond_idx[!is.na(cond_idx)]
+  if (length(idx) == 0) return("")
+  idx <- sort(unique(idx))
+  if (mode == "NO") paste(idx, collapse = ",") else paste(var_names[idx], collapse = ", ")
+}
+
+extract_tree_edges <- function(RVM, tree = 1, var_names = RVM$names) {
+  out <- capture.output(print(RVM))
+  i1 <- grep(paste0("^Tree\\s+", tree, "\\b"), out)[1]
+  i2 <- grep(paste0("^Tree\\s+", tree + 1, "\\b"), out)[1]
+  if (is.na(i1)) stop("Could not find Tree ", tree, " in print(RVM).")
+  if (is.na(i2)) i2 <- length(out) + 1
+  lines <- out[(i1 + 1):(i2 - 1)]
+  lines <- trimws(gsub("^#+\\s*", "", lines))
+  lines <- lines[nzchar(lines)]
+  lines <- lines[grepl("^[0-9]+\\s*,\\s*[0-9]+", lines)]
+  if (length(lines) == 0) return(tibble())
+
+  toks <- strsplit(lines, "\\s+")
+  pair_tok <- vapply(toks, function(z) if (length(z) >= 1) z[1] else NA_character_, character(1))
+  fam_raw <- vapply(toks, function(z) if (length(z) >= 2) z[2] else "Independence", character(1))
+  tau <- suppressWarnings(as.numeric(stringr::str_match(lines, "tau\\s*=\\s*([-0-9.]+)")[, 2]))
+  tau[is.na(tau)] <- 0
+
+  pair_part <- sub("[;|].*$", "", pair_tok)
+  cond_part <- ifelse(grepl("[;|]", pair_tok), sub("^[^;|]+[;|]", "", pair_tok), "")
+  parts <- strsplit(pair_part, ",", fixed = TRUE)
+  v1 <- trimws(vapply(parts, function(z) if (length(z) >= 1) z[1] else NA_character_, character(1)))
+  v2 <- trimws(vapply(parts, function(z) if (length(z) >= 2) z[2] else NA_character_, character(1)))
+
+  idx1 <- suppressWarnings(as.integer(v1))
+  idx2 <- suppressWarnings(as.integer(v2))
+  if (anyNA(idx1)) idx1[is.na(idx1)] <- match(v1[is.na(idx1)], var_names)
+  if (anyNA(idx2)) idx2[is.na(idx2)] <- match(v2[is.na(idx2)], var_names)
+
+  cond_idx <- lapply(cond_part, function(s) {
+    s <- trimws(s)
+    if (!nzchar(s)) return(integer(0))
+    z <- trimws(unlist(strsplit(s, ",", fixed = TRUE)))
+    zi <- suppressWarnings(as.integer(z))
+    if (anyNA(zi)) zi[is.na(zi)] <- match(z[is.na(zi)], var_names)
+    zi[!is.na(zi)]
+  })
+
+  tibble(
+    idx1 = idx1,
+    idx2 = idx2,
+    pair_no = paste(pmin(idx1, idx2), pmax(idx1, idx2), sep = " -- "),
+    pair_name = paste(var_names[pmin(idx1, idx2)], var_names[pmax(idx1, idx2)], sep = " — "),
+    cond_idx = cond_idx,
+    cond_no = vapply(cond_idx, format_cond_label, character(1), var_names = var_names, mode = "NO"),
+    cond_name = vapply(cond_idx, format_cond_label, character(1), var_names = var_names, mode = "name"),
+    family = fam_raw,
+    tau = tau,
+    abs_tau = abs(tau)
+  ) %>% filter(!is.na(idx1), !is.na(idx2))
+}
+
+
+choose_tree_root <- function(RVM, tree = 1) {
+  vn <- RVM$names %||% paste0("V", seq_len(nrow(RVM$Matrix)))
+  nodes <- tibble(name = as.character(seq_along(vn)))
+  ed <- extract_tree_edges(RVM, tree = tree, var_names = vn) %>%
+    transmute(from = as.character(idx1), to = as.character(idx2)) %>%
+    distinct()
+  g <- igraph::graph_from_data_frame(ed, directed = FALSE, vertices = nodes)
+  deg <- igraph::degree(g)
+  igraph::V(g)$name[which.max(deg)]
+}
+
+make_tree_layout <- function(RVM, tree = 1, root = NULL,
+                             orientation = c("auto", "vertical", "horizontal", "radial"),
+                             seed = 1) {
+  orientation <- match.arg(orientation)
+  vn <- RVM$names %||% paste0("V", seq_len(nrow(RVM$Matrix)))
+  nodes <- tibble(name = as.character(seq_along(vn)))
+
+  ed <- extract_tree_edges(RVM, tree = tree, var_names = vn) %>%
+    transmute(from = as.character(idx1), to = as.character(idx2)) %>%
+    distinct() %>%
+    arrange(as.integer(from), as.integer(to))
+
+  g <- igraph::graph_from_data_frame(ed, directed = FALSE, vertices = nodes)
+  node_names <- igraph::V(g)$name
+
+  if (is.null(root) || !(as.character(root) %in% node_names)) {
+    root <- choose_tree_root(RVM, tree = tree)
+  }
+  root_idx <- match(as.character(root), node_names)
+
+  if (orientation == "auto") {
+    orientation <- if (tree == 1) "radial" else "vertical"
+  }
+
+  if (orientation == "radial") {
+    xy <- igraph::layout_as_tree(g, root = root_idx, circular = TRUE)
+    coords <- tibble(name = node_names, x = xy[, 1], y = xy[, 2])
+  } else if (igraph::is_tree(g)) {
+    xy <- igraph::layout_as_tree(g, root = root_idx, circular = FALSE)
+    coords <- tibble(name = node_names, x = -xy[, 2], y = xy[, 1])
+    if (orientation == "horizontal") {
+      coords <- coords %>% transmute(name, x = y, y = x)
+    }
+  } else {
+    set.seed(seed)
+    xy <- igraph::layout_with_fr(g)
+    coords <- tibble(name = node_names, x = xy[, 1], y = xy[, 2])
+    if (orientation == "horizontal") {
+      coords <- coords %>% transmute(name, x = y, y = x)
+    }
+  }
+  coords
+}
+
+plot_individual_tree <- function(fit,
+                                 tree = 1,
+                                 node_label = c("NO", "name"),
+                                 condition_label = c("NO", "name"),
+                                 edge_label = c("auto", "tau", "cond", "tau+cond", "none"),
+                                 min_abs_tau = NULL,
+                                 digits = 2,
+                                 orientation = c("auto", "vertical", "horizontal", "radial"),
+                                 show_indep = TRUE,
+                                 title = NULL) {
+  node_label <- match.arg(node_label)
+  condition_label <- match.arg(condition_label)
+  edge_label <- match.arg(edge_label)
+  orientation <- match.arg(orientation)
+  RVM <- as_rvine_matrix(fit)
+  var_names <- RVM$names %||% paste0("V", seq_len(nrow(RVM$Matrix)))
+
+  if (edge_label == "auto") edge_label <- if (tree == 1) "tau" else "tau+cond"
+  if (is.null(min_abs_tau)) min_abs_tau <- if (tree == 1) 0.20 else 0.10
+
+  nodes <- tibble(
+    name = as.character(seq_along(var_names)),
+    node_text = if (node_label == "NO") as.character(seq_along(var_names)) else var_names
+  )
+
+  ed <- extract_tree_edges(RVM, tree = tree, var_names = var_names) %>%
+    mutate(
+      from = as.character(idx1),
+      to = as.character(idx2),
+      tau_label = formatC(tau, format = "f", digits = digits),
+      cond_label = if (condition_label == "NO") {
+        ifelse(cond_no == "", "", paste0("| ", cond_no))
+      } else {
+        ifelse(cond_name == "", "", paste0("| ", cond_name))
+      },
+      is_indep = abs_tau < 1e-12,
+      label = dplyr::case_when(
+        edge_label == "none" ~ "",
+        edge_label == "tau" ~ dplyr::if_else(abs_tau >= min_abs_tau & !is_indep, tau_label, ""),
+        edge_label == "cond" ~ cond_label,
+        edge_label == "tau+cond" ~ dplyr::case_when(
+          abs_tau >= min_abs_tau & !is_indep & cond_label != "" ~ paste(tau_label, cond_label),
+          abs_tau >= min_abs_tau & !is_indep & cond_label == "" ~ tau_label,
+          TRUE ~ cond_label
+        ),
+        TRUE ~ ""
+      )
+    )
+
+  coords <- make_tree_layout(RVM, tree = tree, orientation = orientation)
+
+  edf <- ed %>% mutate(
+    x = coords$x[match(from, coords$name)],
+    y = coords$y[match(from, coords$name)],
+    xend = coords$x[match(to, coords$name)],
+    yend = coords$y[match(to, coords$name)],
+    xm = (x + xend) / 2,
+    ym = (y + yend) / 2
+  )
+
+  ggplot() +
+    { if (show_indep) geom_segment(
+      data = edf %>% filter(is_indep),
+      aes(x = x, y = y, xend = xend, yend = yend),
+      colour = "grey80", linetype = "dashed", linewidth = 0.6, alpha = 0.9
+    ) } +
+    geom_segment(
+      data = edf %>% filter(!is_indep | !show_indep),
+      aes(x = x, y = y, xend = xend, yend = yend, colour = family),
+      linewidth = 0.9, alpha = 0.95
+    ) +
+    geom_label(
+      data = edf %>% filter(label != ""),
+      aes(x = xm, y = ym, label = label),
+      size = 2.5, label.size = 0, fill = "white", alpha = 0.82,
+      label.padding = unit(0.05, "lines")
+    ) +
+    geom_text(
+      data = coords %>% left_join(nodes, by = "name"),
+      aes(x = x, y = y, label = node_text),
+      size = 4.0, fontface = "bold"
+    ) +
+    coord_equal(clip = "off") +
+    scale_x_continuous(expand = expansion(mult = 0.08)) +
+    scale_y_continuous(expand = expansion(mult = 0.10)) +
+    theme_void(base_size = 12) +
+    labs(title = title %||% paste("Tree", tree), colour = "Copula family") +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "bottom"
+    )
+}
+
+make_individual_tree_table <- function(fit, tree = 1, condition_label = c("NO", "name"), digits = 2) {
+  condition_label <- match.arg(condition_label)
+  RVM <- as_rvine_matrix(fit)
+  var_names <- RVM$names
+
+  out <- extract_tree_edges(RVM, tree = tree, var_names = var_names) %>%
+    transmute(
+      pair = pair_name,
+      condition = if (condition_label == "NO") cond_no else cond_name,
+      family = family,
+      tau = round(tau, digits),
+    )
+
+  if (tree == 1) {
+    out <- out %>% select(-condition)
+  }
+
+  out
+}
+
+make_compare_trees_table <- function(fit_a,
+                                     fit_b,
+                                     tree = 1,
+                                     label_a = "Cluster 1",
+                                     label_b = "Cluster 2",
+                                     condition_label = c("NO", "name"),
+                                     digits = 2) {
+  condition_label <- match.arg(condition_label)
+  RVM_a <- as_rvine_matrix(fit_a)
+  RVM_b <- as_rvine_matrix(fit_b)
+  short_a <- paste0("c", fit_a$cluster %||% label_a)
+  short_b <- paste0("c", fit_b$cluster %||% label_b)
+
+  ea <- extract_tree_edges(RVM_a, tree = tree, var_names = RVM_a$names) %>%
+    mutate(edge_id = paste(pair_name, ifelse(cond_name == "", "", paste0(" | ", cond_name))))
+  eb <- extract_tree_edges(RVM_b, tree = tree, var_names = RVM_b$names) %>%
+    mutate(edge_id = paste(pair_name, ifelse(cond_name == "", "", paste0(" | ", cond_name))))
+
+  out <- full_join(
+    ea %>% select(edge_id, pair_name, cond_no, cond_name, family_a = family, tau_a = tau),
+    eb %>% select(edge_id, pair_name, cond_no, cond_name, family_b = family, tau_b = tau),
+    by = c("edge_id", "pair_name", "cond_no", "cond_name")
+  ) %>%
+    mutate(
+      across(c(tau_a, tau_b), ~ replace_na(., 0)),
+      family_a = replace_na(family_a, "—"),
+      family_b = replace_na(family_b, "—"),
+      abs_delta_tau = abs(tau_a - tau_b)
+    ) %>%
+    transmute(
+      pair = pair_name,
+      condition = if (condition_label == "NO") cond_no else cond_name,
+      !!paste0("family ", short_a) := family_a,
+      !!paste0("family ", short_b) := family_b,
+      !!paste0("tau ", short_a) := round(tau_a, digits),
+      !!paste0("tau ", short_b) := round(tau_b, digits),
+      `abs delta tau` = round(abs_delta_tau, digits)
+    ) %>%
+    arrange(desc(`abs delta tau`), pair)
+
+  if (tree == 1) {
+    out <- out %>% select(-condition)
+  }
+
+  out
+}
+
+latex_safe_caption <- function(x) {
+  x <- gsub("_", " ", x, fixed = TRUE)
+  x <- gsub("|", " ", x, fixed = TRUE)
+  x
+}
+
+report_table <- function(x, caption, digits = 2, long = NULL) {
+  cap <- latex_safe_caption(caption)
+  if (is.null(long)) long <- ncol(x) > 7 || nrow(x) > 20
+  if (knitr::is_latex_output()) {
+    kable(x,
+          format = "latex",
+          booktabs = TRUE,
+          longtable = long,
+          caption = cap,
+          digits = digits,
+          escape = TRUE) %>%
+      kable_styling(
+        latex_options = c("hold_position", if (long) "repeat_header"),
+        full_width = FALSE,
+        font_size = 9
+      )
+  } else {
+    kable(x, digits = digits, caption = cap) %>%
+      kable_styling(full_width = FALSE)
+  }
+}
+```
+
+# Read inputs and build vine dataset
+
+```{r data, include=FALSE}
+inputs <- read_analysis_inputs(params$output_dir)
+analysis_tbl <- switch(
+  params$vine_dataset,
+  base = inputs$base,
+  raw = inputs$raw,
+  pc = inputs$pc,
+  stop("Unknown `params$vine_dataset`: ", params$vine_dataset)
+)
+
+cluster_tbl <- inputs$clusters %>% select(DataZone, cluster = all_of(params$cluster_column))
+membership_source <- detect_cmeans_membership_source(
+  vine_dataset = params$vine_dataset,
+  cluster_column = params$cluster_column,
+  requested_source = params$cmeans_membership_source
+)
+if (is.null(membership_source)) {
+  stop("Could not determine the reference C-means membership source. Set `params$cmeans_membership_source` to 'raw' or 'pc'.")
+}
+
+cmeans_membership_tbl <- get_cmeans_membership_tbl(inputs, membership_source)
+if (is.null(cmeans_membership_tbl)) {
+  stop(
+    "Missing exported reference C-means membership file for source: ", membership_source,
+    ". Expected one of `glasgow_cmeans_memberships_raw.csv` or `glasgow_cmeans_memberships_pc.csv` in `params$output_dir`."
+  )
+}
+if (!("max_membership" %in% names(cmeans_membership_tbl))) {
+  stop("The reference C-means membership file must contain a `max_membership` column.")
+}
+
+feature_cols <- setdiff(names(analysis_tbl), "DataZone")
+
+vine_df <- analysis_tbl %>%
+  select(DataZone, all_of(feature_cols)) %>%
+  left_join(cluster_tbl, by = "DataZone") %>%
+  left_join(cmeans_membership_tbl %>% select(DataZone, max_membership), by = "DataZone")
+
+full_fit_eligibility <- summarise_fit_eligibility(
+  vine_df,
+  cluster_col = "cluster",
+  feature_cols = feature_cols,
+  min_n = 5
+)
+
+core_threshold_candidates <- coerce_threshold_candidates(params$core_threshold_candidates)
+if (length(core_threshold_candidates) == 0) {
+  stop("`params$core_threshold_candidates` must contain at least one numeric threshold between 0 and 1.")
+}
+
+core_threshold_summary <- summarise_core_threshold_candidates(
+  all_df = vine_df,
+  thresholds = core_threshold_candidates,
+  cluster_col = "cluster",
+  feature_cols = feature_cols,
+  min_n = params$core_min_complete_n
+)
+selected_core_threshold <- choose_core_threshold(core_threshold_summary)
+
+if (is.na(selected_core_threshold)) {
+  vine_df_core <- NULL
+  core_fit_eligibility <- core_threshold_summary %>%
+    filter(threshold == min(core_threshold_candidates))
+  eligible_core_clusters <- integer(0)
+} else {
+  vine_df_core <- vine_df %>%
+    filter(!is.na(max_membership) & max_membership >= selected_core_threshold)
+
+  core_fit_eligibility <- core_threshold_summary %>%
+    filter(threshold == selected_core_threshold)
+
+  eligible_core_clusters <- core_fit_eligibility %>%
+    filter(eligible_for_vine) %>%
+    pull(cluster)
+}
+```
+
+# Fit CVine and RVine in each cluster
+
+```{r fit-models, include=FALSE}
+ineligible_full_clusters <- full_fit_eligibility %>%
+  filter(!eligible_for_vine) %>%
+  pull(cluster)
+if (length(ineligible_full_clusters) > 0) {
+  stop(
+    "These full-sample clusters are not eligible for vine fitting: ",
+    paste(ineligible_full_clusters, collapse = ", "),
+    ". Check the eligibility table inputs and missing-data pattern."
+  )
+}
+
+vine_fit_list <- fit_vine_suite(
+  df = vine_df,
+  cluster_col = "cluster",
+  feature_cols = feature_cols
+)
+
+fit_summary <- bind_rows(
+  summarise_vine_fits(vine_fit_list$CVine),
+  summarise_vine_fits(vine_fit_list$RVine)
+) %>% arrange(cluster, type)
+
+if (!is.null(vine_df_core) && length(eligible_core_clusters) > 0) {
+  core_fit_input <- vine_df_core %>% filter(cluster %in% eligible_core_clusters)
+  core_fit_list <- fit_vine_suite(
+    df = core_fit_input,
+    cluster_col = "cluster",
+    feature_cols = feature_cols
+  )
+  core_fit_summary <- bind_rows(
+    summarise_vine_fits(core_fit_list$CVine),
+    summarise_vine_fits(core_fit_list$RVine)
+  ) %>% arrange(cluster, type)
+} else {
+  core_fit_list <- NULL
+  core_fit_summary <- tibble(
+    type = character(),
+    cluster = integer(),
+    n = integer(),
+    d = integer(),
+    logLik = double(),
+    AIC = double(),
+    BIC = double()
+  )
+}
+```
+
+# 1. Full-sample CVine versus RVine model comparison by cluster
+
+```{r full-eligibility}
+report_table(full_fit_eligibility, "Full-sample vine-fit eligibility by cluster", digits = 2)
+```
+
+```{r fit-summary}
+report_table(fit_summary, "CVine and RVine fit statistics by cluster")
+```
+
+```{r selected-models}
+selected_models <- select_best_type_by_cluster(fit_summary, metric = params$selectioncrit)
+model_choice_tbl <- selected_models %>%
+  select(cluster, type, logLik, AIC, BIC, selected) %>%
+  arrange(cluster, desc(selected), BIC, AIC, desc(logLik))
+report_table(model_choice_tbl, paste0("Model choice by cluster using ", params$selectioncrit))
+```
+
+```{r full-sample-model-choice-text, results='asis'}
+full_bic_choice <- select_best_type_by_cluster(fit_summary, metric = "BIC") %>%
+  filter(selected)
+
+if (nrow(full_bic_choice) > 0 && all(full_bic_choice$type == "RVine")) {
+  cat("In the full sample, BIC selects RVine in both clusters.")
+} else {
+  full_bic_sentence <- full_bic_choice %>%
+    transmute(txt = paste0("cluster ", cluster, ": ", type)) %>%
+    pull(txt) %>%
+    paste(collapse = "; ")
+
+  cat("In the full sample, BIC selects ", full_bic_sentence, ".")
+}
+```
+
+# 2. Core-member robustness check using the reference C-means membership file
+
+This section treats the core-member repeat as a **robustness check**, not as the main result. The threshold is chosen from the candidate set `r paste(core_threshold_candidates, collapse = ", ")` using a practical rule: retain the **strictest** threshold that still leaves at least `r params$core_min_complete_n` complete observations in **both** clusters. If no candidate threshold meets that requirement, the document reports the threshold summary but does not fit core-only vine models.
+
+```{r core-threshold-summary}
+core_threshold_tbl_display <- core_threshold_summary %>%
+  transmute(
+    threshold,
+    cluster,
+    n_all,
+    n_core,
+    kept_pct = 100 * retained_pct,
+    status = if_else(eligible_for_vine, "eligible", fit_status)
+  )
+
+report_table(
+  core_threshold_tbl_display,
+  paste0(
+    "Core-member threshold summary from the ",
+    membership_source,
+    " reference C-means file"
+  ),
+  digits = 1,
+  long = FALSE
+)
+```
+
+```{r core-threshold-decision, results='asis'}
+if (is.na(selected_core_threshold)) {
+  cat(
+    "No candidate threshold preserved at least ", params$core_min_complete_n,
+    " complete observations in both clusters. The full-sample vine analysis remains the main result, and no core-only vine fits are reported."
+  )
+} else {
+  highest_candidate <- max(core_threshold_candidates, na.rm = TRUE)
+  highest_candidate_ok <- core_threshold_summary %>%
+    filter(threshold == highest_candidate) %>%
+    summarise(all_ok = all(replace_na(eligible_for_vine, FALSE))) %>%
+    pull(all_ok)
+
+  if (!isTRUE(highest_candidate_ok) && selected_core_threshold < highest_candidate) {
+    cat(
+      "This confirms that a fixed threshold of ", highest_candidate,
+      " would be too severe for Glasgow, so the robustness check is conducted at ",
+      selected_core_threshold,
+      ", the strictest threshold that preserves adequate sample size in both clusters."
+    )
+  } else {
+    cat(
+      "The selected core-member threshold is ", selected_core_threshold,
+      ", which is the strictest candidate that preserves at least ", params$core_min_complete_n,
+      " complete observations in both clusters."
+    )
+  }
+}
+```
+
+```{r core-model-comparison-table}
+if (is.na(selected_core_threshold) || nrow(core_fit_summary) == 0) {
+  cat(
+    "Core-member vine fits were treated as a robustness check and were only attempted at thresholds that preserved adequate complete-case sample size in both clusters."
+  )
+} else {
+  core_bic_choice <- select_best_type_by_cluster(core_fit_summary, metric = "BIC") %>%
+    filter(selected) %>%
+    select(cluster, bic_selected_type = type)
+
+  core_aic_choice <- select_best_type_by_cluster(core_fit_summary, metric = "AIC") %>%
+    filter(selected) %>%
+    select(cluster, aic_selected_type = type)
+
+  core_model_comparison_tbl <- core_fit_summary %>%
+    left_join(core_bic_choice, by = "cluster") %>%
+    left_join(core_aic_choice, by = "cluster") %>%
+    mutate(
+      selected_BIC = type == bic_selected_type,
+      selected_AIC = type == aic_selected_type
+    ) %>%
+    select(cluster, type, n, d, logLik, AIC, BIC, selected_BIC, selected_AIC) %>%
+    arrange(cluster, desc(selected_BIC), BIC, AIC, desc(logLik))
+
+  report_table(
+    core_model_comparison_tbl,
+    paste0("Core-member CVine versus RVine comparison at threshold ", selected_core_threshold)
+  )
+}
+```
+
+```{r core-selected-models-text, results='asis'}
+if (!is.na(selected_core_threshold) && nrow(core_fit_summary) > 0) {
+  core_bic_choice <- select_best_type_by_cluster(core_fit_summary, metric = "BIC") %>%
+    filter(selected)
+  core_aic_choice <- select_best_type_by_cluster(core_fit_summary, metric = "AIC") %>%
+    filter(selected)
+
+  bic_all_rvine <- nrow(core_bic_choice) > 0 && all(core_bic_choice$type == "RVine")
+  aic_cluster1_cvine <- core_aic_choice %>%
+    filter(cluster == 1) %>%
+    summarise(is_cvine = dplyr::first(type) == "CVine") %>%
+    pull(is_cvine)
+
+  if (isTRUE(bic_all_rvine) && isTRUE(aic_cluster1_cvine)) {
+    cat(
+      "In the core-member robustness sample at threshold ", selected_core_threshold,
+      ", BIC again selects RVine in both clusters, while AIC is more mixed in cluster 1."
+    )
+  } else {
+    bic_sentence <- core_bic_choice %>%
+      transmute(txt = paste0("cluster ", cluster, ": ", type)) %>%
+      pull(txt) %>%
+      paste(collapse = "; ")
+    aic_sentence <- core_aic_choice %>%
+      transmute(txt = paste0("cluster ", cluster, ": ", type)) %>%
+      pull(txt) %>%
+      paste(collapse = "; ")
+
+    cat(
+      "In the core-member robustness sample at threshold ", selected_core_threshold,
+      ", BIC selects ", bic_sentence,
+      ". Using AIC, the preferred model is ", aic_sentence, "."
+    )
+  }
+}
+```
+
+# 3. RVine interpretation: compare Trees 1 and 2 across clusters
+
+We treat **RVine** as the main model for interpretation and compare the fitted trees across the two clusters. The full-sample comparison is the headline result; the core-member repeat above is only a robustness check when a practical threshold leaves enough complete observations in both clusters.
+
+```{r rvine-objects, include=FALSE}
+rvine_fits <- vine_fit_list[[params$main_model_type]]
+clusters_available <- names(rvine_fits)
+if (length(clusters_available) < 2) stop("Need at least two fitted clusters for comparison.")
+rv1 <- rvine_fits[[1]]
+rv2 <- rvine_fits[[2]]
+label_1 <- paste(params$main_model_type, "Cluster", rv1$cluster)
+label_2 <- paste(params$main_model_type, "Cluster", rv2$cluster)
+```
+
+## Tree 1
+
+### Tree plots
+
+```{r rvine-tree1-plots, fig.height=10}
+plot_individual_tree(rv1, tree = 1, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "radial", title = paste(label_1, "- Tree 1"))
+plot_individual_tree(rv2, tree = 1, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "radial", title = paste(label_2, "- Tree 1"))
+```
+
+### Key structure table: cluster 1
+
+```{r rvine-tree1-table1}
+report_table(make_individual_tree_table(rv1, tree = 1, condition_label = "name", digits = params$digits),
+           paste(label_1, "Tree 1"))
+```
+
+### Key structure table: cluster 2
+
+```{r rvine-tree1-table2}
+report_table(make_individual_tree_table(rv2, tree = 1, condition_label = "name", digits = params$digits),
+           paste(label_2, "Tree 1"))
+
+```
+
+### Comparison table
+
+```{r rvine-tree1-compare}
+report_table(make_compare_trees_table(rv1, rv2, tree = 1, label_a = label_1, label_b = label_2,
+                                    condition_label = "name", digits = params$digits),
+           paste(params$main_model_type, "Tree 1 comparison across clusters"))
+```
+
+```{r tree2-pagebreak, results="asis", echo=FALSE}
+cat("\newpage")
+```
+
+## Tree 2
+
+### Tree plots
+
+```{r rvine-tree2-plots, fig.height=10}
+plot_individual_tree(rv1, tree = 2, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau+cond", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "vertical", title = paste(label_1, "- Tree 2"))
+plot_individual_tree(rv2, tree = 2, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau+cond", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "vertical", title = paste(label_2, "- Tree 2"))
+```
+
+### Key structure table: cluster 1
+
+```{r rvine-tree2-table1}
+report_table(make_individual_tree_table(rv1, tree = 2, condition_label = "name", digits = params$digits),
+           paste(label_1, "Tree 2"))
+```
+
+### Key structure table: cluster 2
+
+```{r rvine-tree2-table2}
+report_table(make_individual_tree_table(rv2, tree = 2, condition_label = "name", digits = params$digits),
+           paste(label_2, "Tree 2"))
+```
+
+### Comparison table
+
+```{r rvine-tree2-compare}
+report_table(make_compare_trees_table(rv1, rv2, tree = 2, label_a = label_1, label_b = label_2,
+                                    condition_label = "name", digits = params$digits),
+           paste(params$main_model_type, "Tree 2 comparison across clusters"))
+```
+
+```{r appendix-pagebreak, results="asis", echo=FALSE}
+cat("\newpage")
+```
+
+# Appendix: CVine tree plots
+
+```{r cvine-appendix, fig.height=10}
+cvine_fits <- vine_fit_list$CVine
+cv1 <- cvine_fits[[1]]
+cv2 <- cvine_fits[[2]]
+
+plot_individual_tree(cv1, tree = 1, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "radial", title = paste("CVine Cluster", cv1$cluster, "- Tree 1"))
+plot_individual_tree(cv2, tree = 1, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "radial", title = paste("CVine Cluster", cv2$cluster, "- Tree 1"))
+plot_individual_tree(cv1, tree = 2, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau+cond", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "vertical", title = paste("CVine Cluster", cv1$cluster, "- Tree 2"))
+plot_individual_tree(cv2, tree = 2, node_label = params$node_label, condition_label = params$condition_label,
+                     edge_label = "tau+cond", min_abs_tau = params$min_abs_tau, digits = params$digits,
+                     orientation = "vertical", title = paste("CVine Cluster", cv2$cluster, "- Tree 2"))
+```

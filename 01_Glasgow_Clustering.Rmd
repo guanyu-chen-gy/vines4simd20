@@ -1,0 +1,2826 @@
+
+---
+title: "Glasgow Clustering"
+author: "Guanyu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+    toc: true
+  html_document:
+    toc: true
+    df_print: paged
+params:
+  data_dir: simd2020_withgeog
+  csv_file: simd2020_withinds.csv
+  shp_file: sc_dz_11.shp
+  target_board: Glasgow
+  output_dir: outputs/glasgow
+  seed: 123
+  missing_threshold: 10
+  k_grid: !r 1:10
+  chosen_k_raw: 2
+  chosen_k_pc: 2
+  cmeans_m_grid: !r seq(1.1, 2.5, by = 0.1)
+  cmeans_ref_m_raw: 2
+  cmeans_ref_m_pc: 2
+  cmeans_main_ambiguity_threshold: 0.6
+  cmeans_secondary_ambiguity_threshold: 0.7
+  vine_core_membership_threshold: 0.8
+  use_cmeans: true
+  use_mclust: true
+---
+
+# How to use this document
+
+This file is meant to be a **reproducible template** for a joint-board-area clustering study.
+
+To run the same workflow for another joint board area, update:
+
+- `params$target_board`
+- `params$chosen_k_raw`
+- `params$chosen_k_pc`
+- `params$cmeans_ref_m_raw`
+- `params$cmeans_ref_m_pc`
+- `params$k_grid`
+- `params$cmeans_m_grid`
+- `params$cmeans_main_ambiguity_threshold`
+- `params$cmeans_secondary_ambiguity_threshold`
+- `params$output_dir`
+
+The workflow is:
+
+1. **Data preprocessing**
+   - missingness
+   - descriptive statistics
+   - distributions
+   - correlation structure
+   - domain-wise PCA
+2. **Clustering**
+   - K-means (headline partitioning method)
+   - Hierarchical clustering (hard-partition benchmark)
+   - C-means (sensitivity / uncertainty layer)
+   - Finite mixture models (secondary model-based comparator)
+3. **Comparison**
+   - cross-tables for selected clustering results
+   - combined diagnostic plots
+   - cluster maps
+   - difference maps
+
+The design follows the same analysis logic already used in your exploratory document: missingness review, descriptive statistics, domain-grouped distributions, correlation heatmaps, and domain-wise PCA before clustering.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  results = "markup",
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 7,
+  out.width = "100%",
+  dev = "pdf"
+)
+```
+
+```{r packages, include=FALSE}
+required_pkgs <- c(
+  "tidyverse",
+  "sf",
+  "cluster",
+  "factoextra",
+  "patchwork",
+  "e1071",
+  "mclust",
+  "aricode",
+  "salso",
+  "knitr",
+  "kableExtra",
+  "reshape2",
+  "gtools"
+)
+
+missing_pkgs <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_pkgs) > 0) {
+  stop(
+    paste0(
+      "Missing required packages: ",
+      paste(missing_pkgs, collapse = ", "),
+      "\nInstall them first, e.g.:\ninstall.packages(c(",
+      paste(sprintf("\"%s\"", missing_pkgs), collapse = ", "),
+      "))"
+    ),
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(sf)
+  library(cluster)
+  library(factoextra)
+  library(patchwork)
+  library(e1071)
+  library(mclust)
+  library(aricode)
+  library(salso)
+  library(knitr)
+  library(kableExtra)
+  library(reshape2)
+})
+
+set.seed(params$seed)
+
+caption_safe <- function(x) {
+  gsub("_", " ", x, fixed = TRUE)
+}
+
+board_slug <- function(x) {
+  x %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("[^a-z0-9]+", "_") %>%
+    stringr::str_replace_all("^_+|_+$", "")
+}
+
+output_prefix <- board_slug(params$target_board)
+```
+
+# Shared objects
+
+```{r shared-objects}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+joint_board_lookup <- tibble::tribble(
+  ~Council_area,                          ~Joint_Board_area,
+  "East Ayrshire",                       "Ayrshire",
+  "North Ayrshire",                      "Ayrshire",
+  "South Ayrshire",                      "Ayrshire",
+  "Scottish Borders",                    "Borders",
+  "Clackmannanshire",                    "Central Scotland",
+  "Falkirk",                             "Central Scotland",
+  "Stirling",                            "Central Scotland",
+  "Dumfries and Galloway",               "Dumfries and Galloway",
+  "Argyll and Bute",                     "Dunbartonshire and Argyll & Bute",
+  "East Dunbartonshire",                 "Dunbartonshire and Argyll & Bute",
+  "West Dunbartonshire",                 "Dunbartonshire and Argyll & Bute",
+  "Fife",                                "Fife",
+  "Aberdeen City",                       "Grampian",
+  "Aberdeenshire",                       "Grampian",
+  "Moray",                               "Grampian",
+  "Glasgow City",                        "Glasgow",
+  "Highland",                            "Highlands and Islands",
+  "Na h-Eileanan an Iar",                "Highlands and Islands",
+  "North Lanarkshire",                   "Lanarkshire",
+  "South Lanarkshire",                   "Lanarkshire",
+  "East Lothian",                        "Lothian",
+  "City of Edinburgh",                   "Lothian",
+  "Midlothian",                          "Lothian",
+  "West Lothian",                        "Lothian",
+  "Orkney Islands",                      "Orkney and Shetland",
+  "Shetland Islands",                    "Orkney and Shetland",
+  "East Renfrewshire",                   "Renfrewshire",
+  "Inverclyde",                          "Renfrewshire",
+  "Renfrewshire",                        "Renfrewshire",
+  "Angus",                               "Tayside",
+  "Dundee City",                         "Tayside",
+  "Perth and Kinross",                   "Tayside"
+)
+
+indicator_cols <- c(
+  "income_rate", "income_count",
+  "employment_rate", "employment_count",
+  "CIF", "ALCOHOL", "DRUG", "SMR", "DEPRESS",
+  "LBWT", "EMERG", "Attendance", "Attainment",
+  "no_qualifications", "not_participating", "University",
+  "crime_count", "crime_rate",
+  "overcrowded_count", "nocentralheating_count",
+  "overcrowded_rate", "nocentralheating_rate",
+  "drive_petrol", "drive_GP", "drive_post",
+  "drive_primary", "drive_retail", "drive_secondary",
+  "PT_GP", "PT_post", "PT_retail", "broadband"
+)
+
+indicator_domains <- tibble::tribble(
+  ~Indicator,                ~Domain,
+  "income_rate",             "Income",
+  "income_count",            "Income",
+  "employment_rate",         "Employment",
+  "employment_count",        "Employment",
+  "CIF",                     "Health",
+  "ALCOHOL",                 "Health",
+  "DRUG",                    "Health",
+  "SMR",                     "Health",
+  "DEPRESS",                 "Health",
+  "LBWT",                    "Health",
+  "EMERG",                   "Health",
+  "Attendance",              "Education",
+  "Attainment",              "Education",
+  "no_qualifications",       "Education",
+  "not_participating",       "Education",
+  "University",              "Education",
+  "drive_petrol",            "Access",
+  "drive_GP",                "Access",
+  "drive_post",              "Access",
+  "drive_primary",           "Access",
+  "drive_retail",            "Access",
+  "drive_secondary",         "Access",
+  "PT_GP",                   "Access",
+  "PT_post",                 "Access",
+  "PT_retail",               "Access",
+  "broadband",               "Access",
+  "crime_count",             "Crime",
+  "crime_rate",              "Crime",
+  "overcrowded_count",       "Housing",
+  "nocentralheating_count",  "Housing",
+  "overcrowded_rate",        "Housing",
+  "nocentralheating_rate",   "Housing"
+)
+
+domain_order <- c("Income", "Employment", "Health", "Education", "Access", "Crime", "Housing")
+
+group_order <- c("Rates", "Health", "Access", "Education", "Other")
+
+core_domains <- c("Income", "Employment", "Crime", "Housing")
+core_rate_vars <- c(
+  "income_rate",
+  "employment_rate",
+  "crime_rate",
+  "overcrowded_rate",
+  "nocentralheating_rate"
+)
+
+cluster_palette <- c(
+  "1" = "#1f78b4",
+  "2" = "#e31a1c",
+  "3" = "#33a02c",
+  "4" = "#ff7f00",
+  "5" = "#6a3d9a",
+  "6" = "#a6cee3",
+  "7" = "#b2df8a"
+)
+
+domain_palette <- c(
+  "Income" = "#1f77b4",
+  "Employment" = "#2ca02c",
+  "Health" = "#d62728",
+  "Education" = "#9467bd",
+  "Access" = "#ff7f0e",
+  "Crime" = "#17becf",
+  "Housing" = "#8c564b"
+)
+```
+
+# Helper functions
+
+```{r helpers}
+assert_file_exists <- function(path) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  invisible(path)
+}
+
+clean_percent_numeric <- function(df, id_col = "DataZone") {
+  df %>%
+    mutate(
+      across(
+        -all_of(id_col),
+        ~ if (is.character(.x)) {
+          suppressWarnings(as.numeric(stringr::str_remove(.x, "%")))
+        } else {
+          .x
+        }
+      )
+    )
+}
+
+scale_df <- function(df, id_col = "DataZone") {
+  out <- df
+  out[names(out) != id_col] <- scale(out[names(out) != id_col]) %>% as.data.frame()
+  out
+}
+
+make_missing_summary <- function(df, id_col = "DataZone") {
+  df %>%
+    summarise(
+      across(
+        -all_of(id_col),
+        list(
+          Missing_Count = ~ sum(is.na(.)),
+          Percent_Missing = ~ mean(is.na(.)) * 100
+        ),
+        .names = "{.col}.{.fn}"
+      )
+    ) %>%
+    pivot_longer(
+      everything(),
+      names_to = c("Indicator", ".value"),
+      names_sep = "\\."
+    ) %>%
+    arrange(desc(Percent_Missing), Indicator)
+}
+
+describe_var <- function(x) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+
+  if (n < 3) {
+    return(tibble(
+      n = n,
+      mean = NA_real_,
+      median = NA_real_,
+      sd = NA_real_,
+      skewness = NA_real_,
+      kurtosis = NA_real_,
+      Normality_Test = NA_character_,
+      p_value = NA_real_
+    ))
+  }
+
+  p_val <- tryCatch(stats::shapiro.test(x)$p.value, error = function(e) NA_real_)
+
+  tibble(
+    n = n,
+    mean = mean(x),
+    median = median(x),
+    sd = sd(x),
+    skewness = e1071::skewness(x, type = 2),
+    kurtosis = e1071::kurtosis(x, type = 2),
+    Normality_Test = "Shapiro-Wilk",
+    p_value = p_val
+  )
+}
+
+format_stats_table <- function(df, id_col = "DataZone") {
+  df %>%
+    select(-all_of(id_col)) %>%
+    map_dfr(describe_var, .id = "Indicator") %>%
+    mutate(
+      across(c(mean, median, sd, skewness, kurtosis), ~ round(.x, 2)),
+      p_value = ifelse(
+        is.na(p_value), 
+        NA_character_,
+        ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value))
+      )
+    )
+}
+
+first_existing_col <- function(df, candidates) {
+  candidates <- unique(candidates[!is.na(candidates) & nzchar(candidates)])
+  hit <- intersect(candidates, names(df))
+
+  if (length(hit) == 0) {
+    return(NULL)
+  }
+
+  hit[[1]]
+}
+
+best_metric_index <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+
+  if (length(x) == 0 || all(!is.finite(x))) {
+    return(NA_integer_)
+  }
+
+  which.max(replace(x, !is.finite(x), -Inf))
+}
+
+best_metric_k <- function(diag_tbl, metric_col = "silhouette", k_col = "k") {
+  if (is.null(diag_tbl) || nrow(diag_tbl) == 0 || !all(c(metric_col, k_col) %in% names(diag_tbl))) {
+    return(NA_integer_)
+  }
+
+  idx <- best_metric_index(diag_tbl[[metric_col]])
+  if (is.na(idx)) return(NA_integer_)
+
+  as.integer(diag_tbl[[k_col]][idx])
+}
+
+best_metric_value <- function(diag_tbl, metric_col = "silhouette") {
+  if (is.null(diag_tbl) || nrow(diag_tbl) == 0 || !(metric_col %in% names(diag_tbl))) {
+    return(NA_real_)
+  }
+
+  vals <- suppressWarnings(as.numeric(diag_tbl[[metric_col]]))
+  if (length(vals) == 0 || all(!is.finite(vals))) {
+    return(NA_real_)
+  }
+
+  max(vals[is.finite(vals)])
+}
+
+domain_map_for_features <- function(feature_names) {
+  pca_map <- tibble(
+    Indicator = feature_names[stringr::str_detect(feature_names, "_PC[0-9]+$")],
+    Domain = stringr::str_extract(feature_names[stringr::str_detect(feature_names, "_PC[0-9]+$")], "^[A-Za-z]+")
+  )
+
+  bind_rows(indicator_domains, pca_map) %>%
+    filter(Indicator %in% feature_names) %>%
+    distinct() %>%
+    mutate(Domain = factor(Domain, levels = domain_order))
+}
+
+group_map_for_features <- function(feature_names,
+                                   group_levels = get0(
+                                     "group_order",
+                                     ifnotfound = c("Rates", "Health", "Access", "Education", "Other"),
+                                     inherits = TRUE
+                                   )) {
+  domain_map_for_features(feature_names) %>%
+    mutate(
+      Group = case_when(
+        Domain %in% c("Income", "Employment", "Crime", "Housing") ~ "Rates",
+        as.character(Domain) == "Health" ~ "Health",
+        as.character(Domain) == "Access" ~ "Access",
+        as.character(Domain) == "Education" ~ "Education",
+        TRUE ~ "Other"
+      ),
+      Group = factor(Group, levels = group_levels)
+    )
+}
+
+feature_representation_summary <- function(raw_features, pc_features) {
+  tibble(Domain = factor(domain_order, levels = domain_order)) %>%
+    mutate(
+      raw_representation = purrr::map_chr(Domain, function(d) {
+        vals <- domain_map_for_features(raw_features) %>%
+          filter(as.character(Domain) == as.character(d)) %>%
+          pull(Indicator)
+        if (length(vals) == 0) return("—")
+        paste(vals, collapse = ", ")
+      }),
+      pc_representation = purrr::map_chr(Domain, function(d) {
+        vals <- domain_map_for_features(pc_features) %>%
+          filter(as.character(Domain) == as.character(d)) %>%
+          pull(Indicator)
+        if (length(vals) == 0) return("—")
+        paste(vals, collapse = ", ")
+      })
+    ) %>%
+    rename(
+      `Retained raw indicators` = raw_representation,
+      `PC-based representation` = pc_representation
+    )
+}
+
+plot_domain_distributions <- function(df,
+                                      id_col = "DataZone",
+                                      title_text = "Distribution plot",
+                                      geom_type = c("histogram", "density"),
+                                      ncol = 4,
+                                      bins = 30,
+                                      by = c("domain", "group"),
+                                      group_levels = get0(
+                                        "group_order",
+                                        ifnotfound = c("Rates", "Health", "Access", "Education", "Other"),
+                                        inherits = TRUE
+                                      )) {
+  geom_type <- match.arg(geom_type)
+  by <- match.arg(by)
+
+  feature_names <- setdiff(names(df), id_col)
+
+  if (by == "group") {
+    meta_map <- group_map_for_features(feature_names, group_levels = group_levels) %>%
+      rename(Colour_Group = Group)
+    fill_values <- c(
+      "Rates" = "#4C78A8",
+      "Health" = "#E45756",
+      "Access" = "#F58518",
+      "Education" = "#8F63B8",
+      "Other" = "grey70"
+    )
+    fill_lab <- "Group"
+    order_levels <- meta_map %>% arrange(Colour_Group, Domain, Indicator) %>% pull(Indicator)
+  } else {
+    meta_map <- domain_map_for_features(feature_names) %>%
+      rename(Colour_Group = Domain)
+    fill_values <- domain_palette
+    fill_lab <- "Domain"
+    order_levels <- meta_map %>% arrange(Colour_Group, Indicator) %>% pull(Indicator)
+  }
+
+  long_df <- df %>%
+    pivot_longer(-all_of(id_col), names_to = "Indicator", values_to = "Value") %>%
+    left_join(meta_map, by = "Indicator") %>%
+    mutate(
+      Colour_Group = factor(Colour_Group, levels = names(fill_values)),
+      Indicator = factor(Indicator, levels = order_levels)
+    )
+
+  p <- ggplot(long_df, aes(x = Value, fill = Colour_Group, colour = Colour_Group))
+
+  if (geom_type == "histogram") {
+    p <- p +
+      geom_histogram(aes(y = after_stat(density)), bins = bins, alpha = 0.70, linewidth = 0.25)
+  } else {
+    p <- p +
+      geom_density(alpha = 0.30, linewidth = 0.8)
+  }
+
+  p +
+    facet_wrap(~ Indicator, scales = "free", ncol = ncol) +
+    scale_fill_manual(values = fill_values, drop = FALSE) +
+    scale_colour_manual(values = fill_values, drop = FALSE, guide = "none") +
+    labs(title = title_text, x = "Value", y = "Density", fill = fill_lab) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      strip.text = element_text(face = "bold"),
+      legend.position = "right"
+    )
+}
+
+plot_correlation_heatmap <- function(df,
+                                     id_col = "DataZone",
+                                     title_text = "Correlation heatmap") {
+  num_df <- df %>% select(-all_of(id_col))
+  corr_matrix <- cor(num_df, use = "pairwise.complete.obs")
+
+  domain_map <- domain_map_for_features(colnames(num_df))
+  ordered_features <- domain_map %>%
+    arrange(Domain, Indicator) %>%
+    pull(Indicator) %>%
+    intersect(colnames(corr_matrix))
+
+  corr_long <- reshape2::melt(corr_matrix, varnames = c("Var1", "Var2"), value.name = "Correlation") %>%
+    mutate(
+      Var1 = factor(Var1, levels = ordered_features),
+      Var2 = factor(Var2, levels = ordered_features)
+    ) %>%
+    drop_na(Var1, Var2)
+
+  ggplot(corr_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+    geom_tile(color = "white", linewidth = 0.2) +
+    scale_fill_gradient2(
+      low = "#2166ac",
+      mid = "white",
+      high = "#b2182b",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = "Correlation"
+    ) +
+    coord_fixed() +
+    labs(title = title_text, x = "Indicator", y = "Indicator") +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8)
+    )
+}
+
+run_domain_pca <- function(df, domain_map, domains, variance_cutoff = 0.10) {
+  purrr::map(domains, function(domain) {
+    vars <- domain_map %>%
+      filter(Domain == domain, Indicator %in% names(df)) %>%
+      pull(Indicator)
+
+    if (length(vars) == 0) {
+      return(list(
+        domain = domain,
+        pca = NULL,
+        variance = NULL,
+        retained_scores = NULL,
+        loadings = NULL
+      ))
+    }
+
+    pca <- prcomp(df[, vars, drop = FALSE], center = TRUE, scale. = TRUE)
+    var_explained <- (pca$sdev^2) / sum(pca$sdev^2)
+    keep_idx <- which(var_explained > variance_cutoff)
+
+    variance_tbl <- tibble(
+      Domain = domain,
+      PC = paste0("PC", seq_along(var_explained)),
+      Variance = var_explained,
+      Retained = seq_along(var_explained) %in% keep_idx
+    )
+
+    retained_scores <- NULL
+    loadings_tbl <- NULL
+
+    if (length(keep_idx) > 0) {
+      retained_scores <- as_tibble(pca$x[, keep_idx, drop = FALSE])
+      names(retained_scores) <- paste0(domain, "_PC", keep_idx)
+
+      loadings_tbl <- as_tibble(pca$rotation[, keep_idx, drop = FALSE], rownames = "Indicator")
+      names(loadings_tbl)[-1] <- paste0(domain, "_PC", keep_idx)
+    }
+
+    list(
+      domain = domain,
+      pca = pca,
+      variance = variance_tbl,
+      retained_scores = retained_scores,
+      loadings = loadings_tbl
+    )
+  }) %>%
+    rlang::set_names(domains)
+}
+
+plot_domain_variance <- function(var_df, title_text) {
+  pc_levels <- var_df %>%
+    mutate(.pc_num = readr::parse_number(PC)) %>%
+    arrange(.pc_num) %>%
+    pull(PC)
+
+  var_df <- var_df %>%
+    mutate(PC = factor(PC, levels = pc_levels))
+
+  ggplot(var_df, aes(x = PC, y = Variance, fill = Retained)) +
+    geom_col() +
+    geom_text(aes(label = sprintf("%.1f%%", Variance * 100)), vjust = -0.3, size = 3) +
+    scale_fill_manual(values = c("TRUE" = "#1f78b4", "FALSE" = "grey75"), guide = "none") +
+    labs(title = title_text, x = NULL, y = "Variance explained") +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+}
+
+feature_set_dictionary <- function(raw_features, pc_features) {
+  raw_tbl <- tibble(Feature_Set = "raw", Indicator = raw_features) %>%
+    left_join(domain_map_for_features(raw_features), by = "Indicator")
+
+  pc_tbl <- tibble(Feature_Set = "pc", Indicator = pc_features) %>%
+    left_join(domain_map_for_features(pc_features), by = "Indicator")
+
+  bind_rows(raw_tbl, pc_tbl) %>%
+    mutate(Domain = factor(Domain, levels = domain_order)) %>%
+    arrange(Feature_Set, Domain, Indicator)
+}
+
+fit_kmeans_labels <- function(x, k, seed = 123, nstart = 50) {
+  set.seed(seed)
+  stats::kmeans(x, centers = k, nstart = nstart)$cluster
+}
+
+fit_hclust_labels <- function(x, k) {
+  hc <- hclust(dist(x), method = "ward.D2")
+  cutree(hc, k = k)
+}
+
+fit_cmeans_model <- function(x, k, m = 2, seed = 123) {
+  set.seed(seed)
+  e1071::cmeans(x, centers = k, m = m)
+}
+
+fit_cmeans_labels <- function(x, k, m = 2, seed = 123) {
+  fit <- fit_cmeans_model(x, k = k, m = m, seed = seed)
+  max.col(fit$membership)
+}
+
+fit_mclust_model <- function(x, k, seed = 123) {
+  set.seed(seed)
+  mclust::Mclust(x, G = k)
+}
+
+fit_mclust_labels <- function(x, k, seed = 123) {
+  fit_mclust_model(x, k = k, seed = seed)$classification
+}
+
+partition_wss <- function(x, labels) {
+  labels <- as.integer(as.factor(labels))
+  split_idx <- split(seq_len(nrow(x)), labels)
+
+  sum(purrr::map_dbl(split_idx, function(idx) {
+    block <- x[idx, , drop = FALSE]
+    center <- colMeans(block)
+    sum(rowSums((sweep(block, 2, center, FUN = "-"))^2))
+  }))
+}
+
+partition_silhouette <- function(x, labels) {
+  labels <- as.integer(as.factor(labels))
+  if (length(unique(labels)) < 2) return(NA_real_)
+  sil <- cluster::silhouette(labels, dist(x))
+  mean(sil[, "sil_width"])
+}
+
+cmeans_validity <- function(fit) {
+  U <- fit$membership
+  tibble(
+    partition_coefficient = mean(rowSums(U^2)),
+    partition_entropy = -mean(rowSums(U * log(pmax(U, 1e-12))))
+  )
+}
+
+cmeans_membership_summary <- function(fit,
+                                      main_threshold = 0.6,
+                                      secondary_threshold = 0.7) {
+  max_membership <- apply(fit$membership, 1, max)
+
+  tibble(
+    mean_max_membership = mean(max_membership),
+    prop_max_below_main = mean(max_membership < main_threshold),
+    prop_max_below_secondary = mean(max_membership < secondary_threshold)
+  )
+}
+
+method_diagnostics <- function(x, k_grid, method, seed = 123, m = 2) {
+  x_mat <- as.matrix(x)
+
+  purrr::map_dfr(k_grid, function(k) {
+    if (k == 1) {
+      out <- tibble(
+        method = method,
+        k = 1,
+        wss = partition_wss(x_mat, rep(1L, nrow(x_mat))),
+        silhouette = 0
+      )
+
+      if (method == "cmeans") {
+        out <- out %>%
+          bind_cols(tibble(
+            partition_coefficient = NA_real_,
+            partition_entropy = NA_real_,
+            m = m
+          ))
+      } else if (method == "mclust") {
+        out <- out %>%
+          bind_cols(tibble(BIC = NA_real_, ICL = NA_real_))
+      }
+
+      return(out)
+    }
+
+    if (method == "kmeans") {
+      labels <- fit_kmeans_labels(x_mat, k = k, seed = seed)
+      out <- tibble(
+        method = method,
+        k = k,
+        wss = partition_wss(x_mat, labels),
+        silhouette = partition_silhouette(x_mat, labels)
+      )
+    } else if (method == "hierarchical") {
+      labels <- fit_hclust_labels(x_mat, k = k)
+      out <- tibble(
+        method = method,
+        k = k,
+        wss = partition_wss(x_mat, labels),
+        silhouette = partition_silhouette(x_mat, labels)
+      )
+    } else if (method == "cmeans") {
+      fit <- fit_cmeans_model(x_mat, k = k, m = m, seed = seed)
+      labels <- max.col(fit$membership)
+      out <- tibble(
+        method = method,
+        k = k,
+        wss = partition_wss(x_mat, labels),
+        silhouette = partition_silhouette(x_mat, labels)
+      ) %>%
+        bind_cols(cmeans_validity(fit) %>% mutate(m = m))
+    } else if (method == "mclust") {
+      fit <- fit_mclust_model(x_mat, k = k, seed = seed)
+      labels <- fit$classification
+      out <- tibble(
+        method = method,
+        k = k,
+        wss = partition_wss(x_mat, labels),
+        silhouette = partition_silhouette(x_mat, labels)
+      ) %>%
+        bind_cols(tibble(BIC = max(fit$bic, na.rm = TRUE), ICL = fit$icl))
+    } else {
+      stop("Unknown method: ", method)
+    }
+
+    out
+  })
+}
+
+cmeans_fuzziness_diagnostics <- function(x,
+                                        k,
+                                        m_grid,
+                                        seed = 123,
+                                        baseline_labels = NULL,
+                                        main_threshold = 0.6,
+                                        secondary_threshold = 0.7) {
+  x_mat <- as.matrix(x)
+  m_grid <- sort(unique(m_grid))
+
+  fit_list <- purrr::map(m_grid, function(m) {
+    fit <- fit_cmeans_model(x_mat, k = k, m = m, seed = seed)
+    list(
+      m = m,
+      fit = fit,
+      labels = max.col(fit$membership)
+    )
+  })
+
+  purrr::map_dfr(seq_along(fit_list), function(i) {
+    current <- fit_list[[i]]
+    prev_labels <- if (i == 1) NULL else fit_list[[i - 1]]$labels
+
+    tibble(
+      m = current$m,
+      k = k,
+      wss = partition_wss(x_mat, current$labels),
+      silhouette = partition_silhouette(x_mat, current$labels),
+      ari_to_previous_m = if (is.null(prev_labels)) {
+        NA_real_
+      } else {
+        mclust::adjustedRandIndex(prev_labels, current$labels)
+      },
+      ari_to_baseline_kmeans = if (is.null(baseline_labels)) {
+        NA_real_
+      } else {
+        mclust::adjustedRandIndex(as.integer(as.factor(baseline_labels)), current$labels)
+      }
+    ) %>%
+      bind_cols(cmeans_validity(current$fit)) %>%
+      bind_cols(
+        cmeans_membership_summary(
+          current$fit,
+          main_threshold = main_threshold,
+          secondary_threshold = secondary_threshold
+        )
+      )
+  })
+}
+
+plot_diagnostic_curve <- function(diag_df, y_col, title_text, y_lab, method_label = NULL) {
+  ggplot(diag_df, aes(x = k, y = .data[[y_col]])) +
+    geom_line(linewidth = 0.8, colour = "#1f78b4") +
+    geom_point(size = 2, colour = "#1f78b4") +
+    scale_x_continuous(breaks = sort(unique(diag_df$k))) +
+    labs(
+      title = title_text,
+      subtitle = method_label,
+      x = "Number of clusters",
+      y = y_lab
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+plot_cmeans_m_curve <- function(diag_df, y_col, title_text, y_lab, subtitle_text = NULL) {
+  x_limits <- range(diag_df$m, na.rm = TRUE)
+  x_breaks <- pretty(x_limits, n = min(8, length(unique(diag_df$m))))
+
+  ggplot(diag_df, aes(x = m, y = .data[[y_col]])) +
+    geom_line(linewidth = 0.8, colour = "#e31a1c") +
+    geom_point(size = 2, colour = "#e31a1c") +
+    scale_x_continuous(
+      limits = x_limits,
+      breaks = x_breaks
+    ) +
+    labs(
+      title = title_text,
+      subtitle = subtitle_text %||% paste0("k = ", unique(diag_df$k)[1]),
+      x = "Fuzziness m",
+      y = y_lab
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+plot_cmeans_threshold_curve <- function(diag_df,
+                                       title_text,
+                                       subtitle_text = NULL,
+                                       main_threshold = 0.6,
+                                       secondary_threshold = 0.7) {
+  threshold_df <- diag_df %>%
+    select(m, prop_max_below_main, prop_max_below_secondary) %>%
+    pivot_longer(-m, names_to = "metric", values_to = "value") %>%
+    mutate(
+      metric = recode(
+        metric,
+        prop_max_below_main = paste0("Max membership < ", format(main_threshold, nsmall = 1)),
+        prop_max_below_secondary = paste0("Max membership < ", format(secondary_threshold, nsmall = 1))
+      )
+    )
+
+  x_limits <- range(diag_df$m, na.rm = TRUE)
+  x_breaks <- pretty(x_limits, n = min(8, length(unique(diag_df$m))))
+
+  ggplot(threshold_df, aes(x = m, y = value, colour = metric)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2) +
+    scale_x_continuous(limits = x_limits, breaks = x_breaks) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_colour_manual(
+      values = setNames(
+        c("#1f78b4", "#33a02c"),
+        c(
+          paste0("Max membership < ", format(main_threshold, nsmall = 1)),
+          paste0("Max membership < ", format(secondary_threshold, nsmall = 1))
+        )
+      )
+    ) +
+    labs(
+      title = title_text,
+      subtitle = subtitle_text %||% paste0("Thresholds: ", format(main_threshold, nsmall = 1), " and ", format(secondary_threshold, nsmall = 1)),
+      x = "Fuzziness m",
+      y = "Proportion of data zones",
+      colour = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "bottom"
+    )
+}
+
+count_clusters <- function(x) {
+  tibble(cluster = as.character(sort(unique(x)))) %>%
+    mutate(n = purrr::map_int(cluster, ~ sum(as.character(x) == .x, na.rm = TRUE)))
+}
+
+align_cluster_labels <- function(a, b) {
+  a <- as.integer(as.factor(a))
+  b <- as.integer(as.factor(b))
+  ka <- length(unique(a))
+  kb <- length(unique(b))
+
+  if (ka != kb) return(b)
+  k <- ka
+
+  perms <- gtools::permutations(n = k, r = k, v = seq_len(k))
+  tab <- table(a, b)
+  scores <- apply(perms, 1, function(p) {
+    sum(tab[cbind(seq_len(k), p)])
+  })
+  best <- perms[which.max(scores), ]
+
+  mapped <- best[b]
+  as.integer(mapped)
+}
+
+plot_cluster_map <- function(sf_data, cluster_col, title_text = NULL) {
+  x <- as.factor(sf_data[[cluster_col]])
+  levs <- levels(x)
+  cols <- cluster_palette[levs]
+
+  if (any(is.na(cols))) {
+    cols[is.na(cols)] <- grDevices::rainbow(sum(is.na(cols)))
+  }
+
+  counts <- count_clusters(x)
+  labels <- setNames(
+    paste0(counts$cluster, " (n = ", counts$n, ")"),
+    counts$cluster
+  )
+
+  ggplot(sf_data) +
+    geom_sf(aes(fill = as.factor(.data[[cluster_col]])), colour = NA) +
+    scale_fill_manual(values = cols, labels = labels, drop = FALSE, name = "Cluster") +
+    labs(title = title_text %||% cluster_col) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+plot_difference_map <- function(sf_data, cluster_col_a, cluster_col_b, title_text = NULL, align_labels = TRUE) {
+  a <- sf_data[[cluster_col_a]]
+  b <- sf_data[[cluster_col_b]]
+
+  if (align_labels) {
+    same_k <- length(unique(na.omit(a))) == length(unique(na.omit(b)))
+    if (same_k) {
+      b <- align_cluster_labels(a, b)
+    }
+  }
+
+  diff_tbl <- sf_data %>%
+    mutate(
+      .cluster_a = a,
+      .cluster_b = b,
+      comparison = case_when(
+        is.na(.cluster_a) | is.na(.cluster_b) ~ "Missing",
+        .cluster_a == .cluster_b ~ "Same",
+        TRUE ~ "Different"
+      )
+    )
+
+  ggplot(diff_tbl) +
+    geom_sf(aes(fill = comparison), colour = NA) +
+    scale_fill_manual(
+      values = c("Same" = "grey80", "Different" = "#e31a1c", "Missing" = "white"),
+      drop = FALSE
+    ) +
+    labs(
+      title = title_text %||% paste(cluster_col_a, "vs", cluster_col_b),
+      subtitle = "Difference map after optional label alignment",
+      fill = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+
+plot_cmeans_ambiguity_map <- function(sf_data, membership_col, title_text = NULL) {
+  ggplot(sf_data) +
+    geom_sf(aes(fill = .data[[membership_col]]), colour = NA) +
+    scale_fill_viridis_c(
+      option = "C",
+      direction = 1,
+      na.value = "white",
+      name = "Max membership"
+    ) +
+    labs(
+      title = title_text %||% membership_col,
+      subtitle = "Lower values indicate more ambiguous cluster membership."
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+
+plot_cmeans_membership_distribution <- function(membership_df,
+                                               membership_col = "max_membership",
+                                               title_text = NULL,
+                                               main_threshold = 0.6,
+                                               secondary_threshold = 0.7) {
+  ggplot(membership_df, aes(x = .data[[membership_col]])) +
+    geom_histogram(binwidth = 0.02, fill = "#1f78b4", colour = "white", boundary = 0) +
+    geom_vline(xintercept = main_threshold, linetype = "dashed", colour = "#e31a1c") +
+    geom_vline(xintercept = secondary_threshold, linetype = "dotted", colour = "#33a02c") +
+    labs(
+      title = title_text %||% "Distribution of maximum memberships",
+      subtitle = paste0("Dashed = ", format(main_threshold, nsmall = 1), "; dotted = ", format(secondary_threshold, nsmall = 1), "."),
+      x = "Maximum membership",
+      y = "Number of data zones"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+build_cmeans_membership_export <- function(fit,
+                                           datazone,
+                                           main_threshold = 0.6) {
+  membership_mat <- as.matrix(fit$membership)
+
+  if (ncol(membership_mat) != 2) {
+    stop("build_cmeans_membership_export() currently expects k = 2.")
+  }
+
+  tibble(
+    DataZone = datazone,
+    cluster_1_membership = membership_mat[, 1],
+    cluster_2_membership = membership_mat[, 2],
+    max_membership = apply(membership_mat, 1, max),
+    hard_label = max.col(membership_mat)
+  ) %>%
+    mutate(
+      core_borderline_flag = if_else(max_membership < main_threshold, "borderline", "core")
+    )
+}
+
+plot_domain_boxplots <- function(feature_df,
+                                 cluster_col,
+                                 id_col = "DataZone",
+                                 title_text = NULL,
+                                 group_levels = get0(
+                                   "group_order",
+                                   ifnotfound = c("Rates", "Health", "Access", "Education", "Other"),
+                                   inherits = TRUE
+                                 )) {
+  feature_names <- setdiff(names(feature_df), c(id_col, cluster_col))
+  group_map <- group_map_for_features(feature_names, group_levels = group_levels)
+
+  long_df <- feature_df %>%
+    pivot_longer(all_of(feature_names), names_to = "Indicator", values_to = "Value") %>%
+    left_join(group_map, by = "Indicator") %>%
+    mutate(
+      cluster = as.factor(.data[[cluster_col]]),
+      Group = factor(Group, levels = group_levels),
+      Indicator = factor(
+        Indicator,
+        levels = group_map %>% arrange(Group, Domain, Indicator) %>% pull(Indicator)
+      )
+    )
+
+  ggplot(long_df, aes(x = Indicator, y = Value, fill = cluster)) +
+    geom_boxplot(outlier.size = 0.35, alpha = 0.90) +
+    facet_wrap(~ Group, scales = "free_x", ncol = 2) +
+    scale_fill_manual(values = cluster_palette, drop = FALSE, name = "Cluster") +
+    labs(title = title_text %||% cluster_col, x = NULL, y = "Scaled value") +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      strip.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "top"
+    )
+}
+
+selected_similarity_pairs <- function(cluster_cols, method_levels = c("kmeans", "hclust", "cmeans", "mclust")) {
+  meta <- tibble(cluster_col = cluster_cols) %>%
+    tidyr::extract(
+      cluster_col,
+      into = c("feature_set", "method", "k"),
+      regex = "^(raw|pc)_([A-Za-z]+)_k([0-9]+)$",
+      remove = FALSE
+    )
+
+  same_feature_diff_method <- meta %>%
+    inner_join(meta, by = c("feature_set", "k"), suffix = c("_a", "_b")) %>%
+    filter(method_a < method_b)
+
+  same_method_diff_feature <- meta %>%
+    inner_join(meta, by = c("method", "k"), suffix = c("_a", "_b")) %>%
+    filter(feature_set_a == "raw", feature_set_b == "pc")
+
+  bind_rows(
+    same_feature_diff_method %>%
+      transmute(clustering_a = cluster_col_a, clustering_b = cluster_col_b),
+    same_method_diff_feature %>%
+      transmute(clustering_a = cluster_col_a, clustering_b = cluster_col_b)
+  ) %>%
+    distinct()
+}
+
+compute_similarity_table <- function(assignments, pairs_df) {
+  purrr::pmap_dfr(pairs_df, function(clustering_a, clustering_b) {
+    tibble(
+      clustering_a = clustering_a,
+      clustering_b = clustering_b,
+      ARI = mclust::adjustedRandIndex(assignments[[clustering_a]], assignments[[clustering_b]]),
+      NMI = aricode::NMI(assignments[[clustering_a]], assignments[[clustering_b]]),
+      VI = salso::VI(assignments[[clustering_a]], assignments[[clustering_b]])
+    )
+  })
+}
+
+pretty_cluster_label <- function(x) {
+  x %>%
+    stringr::str_replace("^raw_", "raw\n") %>%
+    stringr::str_replace("^pc_", "pc\n") %>%
+    stringr::str_replace("_k", "\nk")
+}
+
+plot_similarity_heatmap <- function(similarity_df, metric = c("ARI", "NMI", "VI"), title_text = NULL) {
+  metric <- match.arg(metric)
+
+  nodes <- sort(unique(c(similarity_df$clustering_a, similarity_df$clustering_b)))
+  mat <- matrix(NA_real_, nrow = length(nodes), ncol = length(nodes), dimnames = list(nodes, nodes))
+  diag(mat) <- if (metric == "VI") 0 else 1
+
+  for (i in seq_len(nrow(similarity_df))) {
+    a <- similarity_df$clustering_a[i]
+    b <- similarity_df$clustering_b[i]
+    val <- similarity_df[[metric]][i]
+    mat[a, b] <- val
+    mat[b, a] <- val
+  }
+
+  heat_df <- as.data.frame(as.table(mat), stringsAsFactors = FALSE) %>%
+    as_tibble() %>%
+    rename(clustering_row = Var1, clustering_col = Var2, value = Freq) %>%
+    mutate(
+      clustering_row = factor(clustering_row, levels = rev(nodes), labels = pretty_cluster_label(rev(nodes))),
+      clustering_col = factor(clustering_col, levels = nodes, labels = pretty_cluster_label(nodes)),
+      label = if_else(is.na(value), "", sprintf("%.3f", value))
+    )
+
+  fill_limits <- if (metric == "VI") c(0, max(heat_df$value, na.rm = TRUE)) else c(0, 1)
+  fill_midpoint <- if (metric == "VI") mean(fill_limits) else 0.5
+
+  ggplot(heat_df, aes(x = clustering_col, y = clustering_row, fill = value)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = label), size = 3.4) +
+    scale_fill_gradient2(
+      low = "#4575b4",
+      mid = "white",
+      high = "#d73027",
+      midpoint = fill_midpoint,
+      limits = fill_limits,
+      na.value = "grey92"
+    ) +
+    coord_equal() +
+    labs(
+      title = title_text %||% metric,
+      x = NULL,
+      y = NULL,
+      fill = metric
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+make_metric_matrix <- function(similarity_df, metric = c("ARI", "NMI", "VI")) {
+  metric <- match.arg(metric)
+
+  nodes <- sort(unique(c(similarity_df$clustering_a, similarity_df$clustering_b)))
+  mat <- matrix(NA_real_, nrow = length(nodes), ncol = length(nodes), dimnames = list(nodes, nodes))
+  diag(mat) <- if (metric == "VI") 0 else 1
+
+  for (i in seq_len(nrow(similarity_df))) {
+    a <- similarity_df$clustering_a[i]
+    b <- similarity_df$clustering_b[i]
+    val <- similarity_df[[metric]][i]
+    mat[a, b] <- val
+    mat[b, a] <- val
+  }
+
+  as_tibble(mat, rownames = "clustering_result")
+}
+
+pick_cluster_col <- function(feature_set, method, k) {
+  paste0(feature_set, "_", method, "_k", k)
+}
+```
+
+```{r extra-package-check}
+if (!requireNamespace("gtools", quietly = TRUE)) {
+  stop("Install package 'gtools' before knitting.")
+}
+```
+
+# Data preprocessing
+
+## Read and filter the data
+
+```{r read-data}
+csv_path <- file.path(params$data_dir, params$csv_file)
+shp_path <- file.path(params$data_dir, params$shp_file)
+
+assert_file_exists(csv_path)
+assert_file_exists(shp_path)
+
+simd_tbl <- readr::read_csv(csv_path, show_col_types = FALSE)
+simd_shp <- sf::st_read(shp_path, quiet = TRUE)
+
+simd_joined <- simd_shp %>%
+  left_join(simd_tbl, by = c("DataZone" = "Data_Zone")) %>%
+  left_join(joint_board_lookup, by = "Council_area")
+
+overall_rank_source_col <- first_existing_col(
+  simd_joined,
+  c(
+    "SIMD2020v2_Rank",
+    "SIMD2020_Rank",
+    "SIMD_Rank",
+    "Overall_SIMD_Rank",
+    "overall_simd_rank",
+    "simd_rank"
+  )
+)
+
+if (is.null(overall_rank_source_col)) {
+  board_meta <- simd_joined %>%
+    filter(Joint_Board_area == params$target_board) %>%
+    st_drop_geometry() %>%
+    transmute(DataZone, overall_simd_rank = NA_real_)
+} else {
+  board_meta <- simd_joined %>%
+    filter(Joint_Board_area == params$target_board) %>%
+    st_drop_geometry() %>%
+    transmute(DataZone, overall_simd_rank = .data[[overall_rank_source_col]])
+}
+
+board_sf <- simd_joined %>%
+  filter(Joint_Board_area == params$target_board) %>%
+  select(DataZone, geometry, any_of(indicator_cols))
+
+board_raw <- board_sf %>%
+  st_drop_geometry() %>%
+  clean_percent_numeric(id_col = "DataZone")
+```
+
+## Missingness
+
+```{r missingness}
+missing_summary <- make_missing_summary(board_raw, id_col = "DataZone")
+missing_summary_nonzero <- missing_summary %>%
+  filter(Missing_Count > 0)
+
+if (nrow(missing_summary_nonzero) == 0) {
+  cat("No indicators have missing values in this board after reading the source file.")
+} else {
+  kable(
+    missing_summary_nonzero,
+    digits = 2,
+    caption = paste0("Indicators with missing values in ", params$target_board)
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+```
+
+```{r choose-indicators}
+kept_indicators <- missing_summary %>%
+  filter(Percent_Missing <= params$missing_threshold) %>%
+  pull(Indicator)
+
+dropped_indicators <- setdiff(indicator_cols, kept_indicators)
+
+board_complete <- board_raw %>%
+  select(DataZone, all_of(kept_indicators)) %>%
+  tidyr::drop_na()
+
+board_sf_complete <- board_sf %>%
+  semi_join(board_complete, by = "DataZone")
+
+cat("Indicators retained after missingness filtering:", length(kept_indicators), "
+
+")
+cat("Indicators dropped:", ifelse(length(dropped_indicators) == 0, "None", paste(dropped_indicators, collapse = ", ")))
+```
+
+## Statistics
+
+```{r statistics}
+analysis_stats_tbl <- format_stats_table(board_complete, id_col = "DataZone")
+
+kable(
+  analysis_stats_tbl,
+  caption = paste0("Descriptive statistics for ", params$target_board, " analysis data")
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Distribution
+
+```{r distributions, echo=FALSE, fig.width=11, fig.height=9}
+plot_domain_distributions(
+  board_complete,
+  id_col = "DataZone",
+  title_text = paste0("Distribution of ", params$target_board, " indicators"),
+  by = "domain"
+)
+```
+
+## Correlation
+
+```{r correlation-all, echo=FALSE, fig.width=11, fig.height=9}
+plot_correlation_heatmap(
+  board_complete,
+  id_col = "DataZone",
+  title_text = paste0("Correlation heatmap of ", params$target_board, " indicators")
+)
+```
+
+## PCA
+
+The two clustering feature sets keep the rate variables for Income, Employment, Crime, and Housing in both designs.
+
+For the remaining domains:
+
+- the **raw-indicator-based** set keeps all raw indicators with missingness below the threshold;
+- the **PC-based** set replaces the remaining domains with domain-wise PCs whose **individual variance explained is greater than 10%**.
+
+```{r build-feature-sets}
+available_domains <- indicator_domains %>%
+  filter(Indicator %in% kept_indicators) %>%
+  mutate(Domain = factor(Domain, levels = domain_order))
+
+remaining_domains <- available_domains %>%
+  filter(!Domain %in% core_domains) %>%
+  distinct(Domain) %>%
+  pull(Domain) %>%
+  as.character()
+
+available_core_rate_vars <- intersect(core_rate_vars, names(board_complete))
+
+raw_remaining_vars <- available_domains %>%
+  filter(!Domain %in% core_domains) %>%
+  pull(Indicator)
+
+raw_feature_tbl <- board_complete %>%
+  select(DataZone, all_of(c(available_core_rate_vars, raw_remaining_vars))) %>%
+  scale_df(id_col = "DataZone")
+
+pca_input_tbl <- board_complete %>%
+  select(DataZone, all_of(unique(c(available_core_rate_vars, raw_remaining_vars)))) %>%
+  scale_df(id_col = "DataZone")
+
+pca_results <- run_domain_pca(
+  df = pca_input_tbl %>% select(-DataZone),
+  domain_map = available_domains,
+  domains = remaining_domains,
+  variance_cutoff = 0.10
+)
+
+variance_tbl <- bind_rows(purrr::map(pca_results, "variance"))
+loadings_tbl <- bind_rows(purrr::map(pca_results, "loadings"), .id = "Domain_Source")
+retained_pc_scores <- purrr::map(pca_results, "retained_scores") %>% purrr::compact()
+
+pc_feature_tbl <- board_complete %>%
+  select(DataZone, all_of(available_core_rate_vars)) %>%
+  scale_df(id_col = "DataZone")
+
+if (length(retained_pc_scores) > 0) {
+  pc_feature_tbl <- bind_cols(
+    pc_feature_tbl %>% select(DataZone),
+    pc_feature_tbl %>% select(-DataZone),
+    bind_cols(retained_pc_scores)
+  )
+}
+
+raw_feature_names <- setdiff(names(raw_feature_tbl), "DataZone")
+pc_feature_names <- setdiff(names(pc_feature_tbl), "DataZone")
+```
+
+\newpage
+
+```{r feature-dictionaries, results='asis'}
+feature_representation_tbl <- feature_representation_summary(raw_feature_names, pc_feature_names)
+
+kable(
+  feature_representation_tbl,
+  caption = "Domain-wise comparison of variables retained in the raw and PC-based feature sets",
+  booktabs = TRUE,
+  longtable = TRUE
+) %>%
+  kable_styling(full_width = FALSE, latex_options = c("repeat_header"))
+```
+
+```{r pca-variance, fig.width=12, fig.height=8}
+if (nrow(variance_tbl) > 0) {
+  var_plots <- variance_tbl %>%
+    split(.$Domain) %>%
+    purrr::imap(~ plot_domain_variance(.x, paste(.y, "domain PCA")))
+
+  wrap_plots(var_plots) +
+    plot_annotation(
+      title = "Variance explained by domain-wise principal components",
+      subtitle = "PCs retained when individual variance explained is greater than 10%"
+    )
+}
+```
+
+```{r pca-loadings, results='asis', echo=FALSE}
+if (nrow(loadings_tbl) > 0) {
+  split_loadings <- split(loadings_tbl, loadings_tbl$Domain_Source)
+
+  purrr::iwalk(split_loadings, function(tbl, nm) {
+    tbl_out <- tbl %>%
+      select(Indicator, starts_with(paste0(nm, "_")))
+    cat("\n\n")
+    print(
+      kable(
+        tbl_out,
+        digits = 3,
+        caption = paste0("PCA loadings for retained ", nm, " components")
+      ) %>%
+        kable_styling(full_width = FALSE)
+    )
+    cat("\n\n")
+  })
+}
+```
+
+```{r raw-feature-distributions, echo=FALSE, fig.width=10, fig.height=9}
+plot_domain_distributions(
+  raw_feature_tbl,
+  id_col = "DataZone",
+  title_text = "Distribution of raw-indicator-based clustering variables",
+  geom_type = "histogram",
+  ncol = 4,
+  bins = 20,
+  by = "domain"
+)
+```
+
+```{r pc-feature-distributions, echo=FALSE, fig.width=10, fig.height=7}
+plot_domain_distributions(
+  pc_feature_tbl,
+  id_col = "DataZone",
+  title_text = "Distribution of PC-based clustering variables",
+  geom_type = "histogram",
+  ncol = 4,
+  bins = 20,
+  by = "domain"
+)
+```
+
+```{r feature-set-correlations, echo=FALSE, fig.width=11, fig.height=10}
+p_raw_corr <- plot_correlation_heatmap(
+  raw_feature_tbl,
+  id_col = "DataZone",
+  title_text = "Correlation heatmap: raw-indicator-based feature set"
+)
+
+p_pc_corr <- plot_correlation_heatmap(
+  pc_feature_tbl,
+  id_col = "DataZone",
+  title_text = "Correlation heatmap: PC-based feature set"
+)
+
+wrap_plots(p_raw_corr, p_pc_corr, ncol = 1)
+```
+
+
+# Clustering
+
+```{r clustering-inputs, include=FALSE}
+raw_x <- as.matrix(raw_feature_tbl %>% select(-DataZone))
+pc_x <- as.matrix(pc_feature_tbl %>% select(-DataZone))
+
+selected_k_raw <- params$chosen_k_raw
+selected_k_pc <- params$chosen_k_pc
+reference_m_raw <- params$cmeans_ref_m_raw
+reference_m_pc <- params$cmeans_ref_m_pc
+```
+
+## K-means
+
+### Raw-based clustering
+
+```{r kmeans-raw-diagnostics, fig.width=13, fig.height=6}
+diag_kmeans_raw <- method_diagnostics(raw_x, params$k_grid, method = "kmeans", seed = params$seed) %>%
+  mutate(feature_set = "raw")
+
+p_kmeans_raw_wss <- plot_diagnostic_curve(
+  diag_kmeans_raw,
+  y_col = "wss",
+  title_text = "K-means elbow plot",
+  y_lab = "Within-cluster sum of squares",
+  method_label = "Raw-indicator-based feature set"
+)
+
+p_kmeans_raw_sil <- plot_diagnostic_curve(
+  diag_kmeans_raw,
+  y_col = "silhouette",
+  title_text = "K-means silhouette plot",
+  y_lab = "Average silhouette width",
+  method_label = "Raw-indicator-based feature set"
+)
+
+wrap_plots(p_kmeans_raw_wss, p_kmeans_raw_sil, ncol = 2)
+```
+
+```{r kmeans-raw-fit}
+raw_kmeans_col <- pick_cluster_col("raw", "kmeans", selected_k_raw)
+
+cluster_assignments <- tibble(DataZone = board_complete$DataZone)
+cluster_assignments[[raw_kmeans_col]] <- fit_kmeans_labels(raw_x, k = selected_k_raw, seed = params$seed)
+
+raw_kmeans_features <- raw_feature_tbl %>%
+  left_join(cluster_assignments %>% select(DataZone, all_of(raw_kmeans_col)), by = "DataZone")
+
+kable(
+  count_clusters(raw_kmeans_features[[raw_kmeans_col]]),
+  caption = paste0("Cluster sizes for ", caption_safe(raw_kmeans_col))
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r kmeans-raw-boxplot, fig.width=13, fig.height=9}
+plot_domain_boxplots(
+  raw_kmeans_features,
+  cluster_col = raw_kmeans_col,
+  title_text = paste0("K-means, raw feature set: ", raw_kmeans_col)
+)
+```
+
+### PC-based clustering
+
+```{r kmeans-pc-diagnostics, fig.width=13, fig.height=6}
+diag_kmeans_pc <- method_diagnostics(pc_x, params$k_grid, method = "kmeans", seed = params$seed) %>%
+  mutate(feature_set = "pc")
+
+p_kmeans_pc_wss <- plot_diagnostic_curve(
+  diag_kmeans_pc,
+  y_col = "wss",
+  title_text = "K-means elbow plot",
+  y_lab = "Within-cluster sum of squares",
+  method_label = "PC-based feature set"
+)
+
+p_kmeans_pc_sil <- plot_diagnostic_curve(
+  diag_kmeans_pc,
+  y_col = "silhouette",
+  title_text = "K-means silhouette plot",
+  y_lab = "Average silhouette width",
+  method_label = "PC-based feature set"
+)
+
+wrap_plots(p_kmeans_pc_wss, p_kmeans_pc_sil, ncol = 2)
+```
+
+```{r kmeans-pc-fit}
+pc_kmeans_col <- pick_cluster_col("pc", "kmeans", selected_k_pc)
+cluster_assignments[[pc_kmeans_col]] <- fit_kmeans_labels(pc_x, k = selected_k_pc, seed = params$seed)
+
+pc_kmeans_features <- pc_feature_tbl %>%
+  left_join(cluster_assignments %>% select(DataZone, all_of(pc_kmeans_col)), by = "DataZone")
+
+kable(
+  count_clusters(pc_kmeans_features[[pc_kmeans_col]]),
+  caption = paste0("Cluster sizes for ", caption_safe(pc_kmeans_col))
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r kmeans-pc-boxplot, fig.width=13, fig.height=9}
+plot_domain_boxplots(
+  pc_kmeans_features,
+  cluster_col = pc_kmeans_col,
+  title_text = paste0("K-means, PC feature set: ", pc_kmeans_col)
+)
+```
+
+### Comparison
+
+```{r kmeans-comparison}
+kmeans_comparison_tbl <- tibble(
+  comparison = c("raw", "pc"),
+  selected_k = c(selected_k_raw, selected_k_pc),
+  best_silhouette_k = c(
+    best_metric_k(diag_kmeans_raw, "silhouette", "k"),
+    best_metric_k(diag_kmeans_pc, "silhouette", "k")
+  ),
+  best_silhouette = c(
+    best_metric_value(diag_kmeans_raw, "silhouette"),
+    best_metric_value(diag_kmeans_pc, "silhouette")
+  )
+)
+
+kable(
+  kmeans_comparison_tbl,
+  digits = 3,
+  caption = "K-means comparison between raw and PC feature sets"
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Hierarchical clustering
+
+### Raw-based clustering
+
+```{r hclust-raw-diagnostics, fig.width=13, fig.height=6}
+diag_hclust_raw <- method_diagnostics(raw_x, params$k_grid, method = "hierarchical", seed = params$seed) %>%
+  mutate(feature_set = "raw")
+
+p_hclust_raw_wss <- plot_diagnostic_curve(
+  diag_hclust_raw,
+  y_col = "wss",
+  title_text = "Hierarchical elbow plot",
+  y_lab = "Within-cluster sum of squares",
+  method_label = "Raw-indicator-based feature set"
+)
+
+p_hclust_raw_sil <- plot_diagnostic_curve(
+  diag_hclust_raw,
+  y_col = "silhouette",
+  title_text = "Hierarchical silhouette plot",
+  y_lab = "Average silhouette width",
+  method_label = "Raw-indicator-based feature set"
+)
+
+wrap_plots(p_hclust_raw_wss, p_hclust_raw_sil, ncol = 2)
+```
+
+```{r hclust-raw-fit}
+raw_hclust_col <- pick_cluster_col("raw", "hclust", selected_k_raw)
+cluster_assignments[[raw_hclust_col]] <- fit_hclust_labels(raw_x, k = selected_k_raw)
+
+raw_hclust_features <- raw_feature_tbl %>%
+  left_join(cluster_assignments %>% select(DataZone, all_of(raw_hclust_col)), by = "DataZone")
+
+kable(
+  count_clusters(raw_hclust_features[[raw_hclust_col]]),
+  caption = paste0("Cluster sizes for ", caption_safe(raw_hclust_col))
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r hclust-raw-boxplot, fig.width=13, fig.height=9}
+plot_domain_boxplots(
+  raw_hclust_features,
+  cluster_col = raw_hclust_col,
+  title_text = paste0("Hierarchical clustering, raw feature set: ", raw_hclust_col)
+)
+```
+
+### PC-based clustering
+
+```{r hclust-pc-diagnostics, fig.width=13, fig.height=6}
+diag_hclust_pc <- method_diagnostics(pc_x, params$k_grid, method = "hierarchical", seed = params$seed) %>%
+  mutate(feature_set = "pc")
+
+p_hclust_pc_wss <- plot_diagnostic_curve(
+  diag_hclust_pc,
+  y_col = "wss",
+  title_text = "Hierarchical elbow plot",
+  y_lab = "Within-cluster sum of squares",
+  method_label = "PC-based feature set"
+)
+
+p_hclust_pc_sil <- plot_diagnostic_curve(
+  diag_hclust_pc,
+  y_col = "silhouette",
+  title_text = "Hierarchical silhouette plot",
+  y_lab = "Average silhouette width",
+  method_label = "PC-based feature set"
+)
+
+wrap_plots(p_hclust_pc_wss, p_hclust_pc_sil, ncol = 2)
+```
+
+```{r hclust-pc-fit}
+pc_hclust_col <- pick_cluster_col("pc", "hclust", selected_k_pc)
+cluster_assignments[[pc_hclust_col]] <- fit_hclust_labels(pc_x, k = selected_k_pc)
+
+pc_hclust_features <- pc_feature_tbl %>%
+  left_join(cluster_assignments %>% select(DataZone, all_of(pc_hclust_col)), by = "DataZone")
+
+kable(
+  count_clusters(pc_hclust_features[[pc_hclust_col]]),
+  caption = paste0("Cluster sizes for ", caption_safe(pc_hclust_col))
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r hclust-pc-boxplot, fig.width=13, fig.height=9}
+plot_domain_boxplots(
+  pc_hclust_features,
+  cluster_col = pc_hclust_col,
+  title_text = paste0("Hierarchical clustering, PC feature set: ", pc_hclust_col)
+)
+```
+
+### Comparison
+
+```{r hclust-comparison}
+hclust_comparison_tbl <- tibble(
+  comparison = c("raw", "pc"),
+  selected_k = c(selected_k_raw, selected_k_pc),
+  best_silhouette_k = c(
+    best_metric_k(diag_hclust_raw, "silhouette", "k"),
+    best_metric_k(diag_hclust_pc, "silhouette", "k")
+  ),
+  best_silhouette = c(
+    best_metric_value(diag_hclust_raw, "silhouette"),
+    best_metric_value(diag_hclust_pc, "silhouette")
+  )
+)
+
+kable(
+  hclust_comparison_tbl,
+  digits = 3,
+  caption = "Hierarchical clustering comparison between raw and PC feature sets"
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## C-means (sensitivity / uncertainty layer)
+
+C-means is retained here as a **sensitivity / uncertainty layer** around the headline two-cluster K-means result. It is used to show which data zones are **core members** of each profile and which are **boundary cases**, not to reopen the choice of `k` and not to claim a sharp optimum in `m`.
+
+Accordingly, `k` is held fixed at the chosen K-means value for each feature set, and the fuzziness exponent `m` is varied over a practical range (`params$cmeans_m_grid`, default `1.1` to `2.5`). The **reference/reporting value `m = 2`** is used for the headline C-means summaries, not as a strongly selected optimum. The main C-means diagnostics are therefore:
+
+- mean maximum membership,
+- proportion with maximum membership below `r params$cmeans_main_ambiguity_threshold` (main ambiguity threshold),
+- proportion with maximum membership below `r params$cmeans_secondary_ambiguity_threshold` (stricter secondary threshold),
+- ARI between adjacent `m` values,
+- ARI between hardened C-means labels and the baseline K-means labels.
+
+Silhouette and WSS are kept only as **secondary compactness summaries** of hardened assignments.
+
+### Raw-based clustering
+
+```{r cmeans-raw-sensitivity}
+if (isTRUE(params$use_cmeans)) {
+  cmeans_m_diag_raw <- cmeans_fuzziness_diagnostics(
+    raw_x,
+    k = selected_k_raw,
+    m_grid = params$cmeans_m_grid,
+    seed = params$seed,
+    baseline_labels = cluster_assignments[[raw_kmeans_col]],
+    main_threshold = params$cmeans_main_ambiguity_threshold,
+    secondary_threshold = params$cmeans_secondary_ambiguity_threshold
+  )
+
+  p_cmeans_raw_meanmax <- plot_cmeans_m_curve(
+    cmeans_m_diag_raw,
+    y_col = "mean_max_membership",
+    title_text = "Mean max membership",
+    y_lab = "Mean maximum membership",
+    subtitle_text = "Raw feature set"
+  )
+
+  p_cmeans_raw_prop <- plot_cmeans_threshold_curve(
+    cmeans_m_diag_raw,
+    title_text = "Ambiguity shares",
+    subtitle_text = "Raw feature set",
+    main_threshold = params$cmeans_main_ambiguity_threshold,
+    secondary_threshold = params$cmeans_secondary_ambiguity_threshold
+  )
+
+  p_cmeans_raw_ari_prev <- plot_cmeans_m_curve(
+    cmeans_m_diag_raw,
+    y_col = "ari_to_previous_m",
+    title_text = "ARI to previous m",
+    y_lab = "ARI to previous m",
+    subtitle_text = "Raw feature set"
+  )
+
+  p_cmeans_raw_ari_base <- plot_cmeans_m_curve(
+    cmeans_m_diag_raw,
+    y_col = "ari_to_baseline_kmeans",
+    title_text = "ARI to K-means",
+    y_lab = "ARI to baseline K-means",
+    subtitle_text = "Raw feature set"
+  )
+
+  ((p_cmeans_raw_meanmax | p_cmeans_raw_prop) / (p_cmeans_raw_ari_prev | p_cmeans_raw_ari_base)) +
+    patchwork::plot_annotation(title = paste0("Raw C-means sensitivity (k = ", selected_k_raw, ")"))
+}
+```
+
+```{r cmeans-raw-fit}
+if (isTRUE(params$use_cmeans)) {
+  raw_cmeans_col <- pick_cluster_col("raw", "cmeans", selected_k_raw)
+  raw_cmeans_membership_col <- paste0(raw_cmeans_col, "_max_membership")
+
+  raw_cmeans_fit <- fit_cmeans_model(
+    raw_x,
+    k = selected_k_raw,
+    m = reference_m_raw,
+    seed = params$seed
+  )
+
+  raw_cmeans_membership_export <- build_cmeans_membership_export(
+    raw_cmeans_fit,
+    datazone = raw_feature_tbl$DataZone,
+    main_threshold = params$cmeans_main_ambiguity_threshold
+  )
+
+  raw_cmeans_membership_tbl <- raw_cmeans_membership_export %>%
+    transmute(
+      DataZone,
+      !!raw_cmeans_col := hard_label,
+      !!raw_cmeans_membership_col := max_membership
+    )
+
+  cluster_assignments[[raw_cmeans_col]] <- raw_cmeans_membership_tbl[[raw_cmeans_col]]
+
+  raw_cmeans_features <- raw_feature_tbl %>%
+    left_join(
+      raw_cmeans_membership_tbl %>% select(DataZone, all_of(raw_cmeans_col)),
+      by = "DataZone"
+    )
+
+  raw_cmeans_reference_summary <- cmeans_m_diag_raw %>%
+    slice(which.min(abs(m - reference_m_raw))) %>%
+    transmute(
+      `k` = k,
+      `Reference/reporting value m` = m,
+      `Mean max membership` = mean_max_membership,
+      `Prop. max < 0.6` = prop_max_below_main,
+      `Prop. max < 0.7` = prop_max_below_secondary,
+      `ARI to previous m` = ari_to_previous_m,
+      `ARI to K-means` = ari_to_baseline_kmeans,
+      `Silhouette (hard labels)` = silhouette
+    )
+
+  kable(
+    raw_cmeans_reference_summary,
+    digits = 3,
+    caption = "Reference C-means summary for the raw feature set"
+  ) %>%
+    kable_styling(full_width = FALSE)
+
+  kable(
+    count_clusters(raw_cmeans_features[[raw_cmeans_col]]),
+    caption = paste0("Cluster sizes for ", caption_safe(raw_cmeans_col))
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+```
+
+```{r cmeans-raw-boxplot, fig.width=13, fig.height=9}
+if (isTRUE(params$use_cmeans)) {
+  plot_domain_boxplots(
+    raw_cmeans_features,
+    cluster_col = raw_cmeans_col,
+    title_text = paste0("C-means reference solution, raw feature set: ", raw_cmeans_col, " (reference/reporting value m = ", reference_m_raw, ")")
+  )
+}
+```
+
+```{r cmeans-raw-ambiguity-map, fig.width=8, fig.height=6}
+if (isTRUE(params$use_cmeans)) {
+  raw_cmeans_map_sf <- board_sf_complete %>%
+    select(DataZone, geometry) %>%
+    left_join(
+      raw_cmeans_membership_tbl %>% select(DataZone, all_of(raw_cmeans_membership_col)),
+      by = "DataZone"
+    )
+
+  plot_cmeans_ambiguity_map(
+    raw_cmeans_map_sf,
+    membership_col = raw_cmeans_membership_col,
+    title_text = paste0("Most ambiguous areas in the raw C-means solution at the reference/reporting value m = ", reference_m_raw, "")
+  )
+}
+```
+
+### PC-based clustering
+
+```{r cmeans-pc-sensitivity}
+if (isTRUE(params$use_cmeans)) {
+  cmeans_m_diag_pc <- cmeans_fuzziness_diagnostics(
+    pc_x,
+    k = selected_k_pc,
+    m_grid = params$cmeans_m_grid,
+    seed = params$seed,
+    baseline_labels = cluster_assignments[[pc_kmeans_col]],
+    main_threshold = params$cmeans_main_ambiguity_threshold,
+    secondary_threshold = params$cmeans_secondary_ambiguity_threshold
+  )
+
+  p_cmeans_pc_meanmax <- plot_cmeans_m_curve(
+    cmeans_m_diag_pc,
+    y_col = "mean_max_membership",
+    title_text = "Mean max membership",
+    y_lab = "Mean maximum membership",
+    subtitle_text = "PC feature set"
+  )
+
+  p_cmeans_pc_prop <- plot_cmeans_threshold_curve(
+    cmeans_m_diag_pc,
+    title_text = "Ambiguity shares",
+    subtitle_text = "PC feature set",
+    main_threshold = params$cmeans_main_ambiguity_threshold,
+    secondary_threshold = params$cmeans_secondary_ambiguity_threshold
+  )
+
+  p_cmeans_pc_ari_prev <- plot_cmeans_m_curve(
+    cmeans_m_diag_pc,
+    y_col = "ari_to_previous_m",
+    title_text = "ARI to previous m",
+    y_lab = "ARI to previous m",
+    subtitle_text = "PC feature set"
+  )
+
+  p_cmeans_pc_ari_base <- plot_cmeans_m_curve(
+    cmeans_m_diag_pc,
+    y_col = "ari_to_baseline_kmeans",
+    title_text = "ARI to K-means",
+    y_lab = "ARI to baseline K-means",
+    subtitle_text = "PC feature set"
+  )
+
+  ((p_cmeans_pc_meanmax | p_cmeans_pc_prop) / (p_cmeans_pc_ari_prev | p_cmeans_pc_ari_base)) +
+    patchwork::plot_annotation(title = paste0("PC C-means sensitivity (k = ", selected_k_pc, ")"))
+}
+```
+
+```{r cmeans-pc-fit}
+if (isTRUE(params$use_cmeans)) {
+  pc_cmeans_col <- pick_cluster_col("pc", "cmeans", selected_k_pc)
+  pc_cmeans_membership_col <- paste0(pc_cmeans_col, "_max_membership")
+
+  pc_cmeans_fit <- fit_cmeans_model(
+    pc_x,
+    k = selected_k_pc,
+    m = reference_m_pc,
+    seed = params$seed
+  )
+
+  pc_cmeans_membership_export <- build_cmeans_membership_export(
+    pc_cmeans_fit,
+    datazone = pc_feature_tbl$DataZone,
+    main_threshold = params$cmeans_main_ambiguity_threshold
+  )
+
+  pc_cmeans_membership_tbl <- pc_cmeans_membership_export %>%
+    transmute(
+      DataZone,
+      !!pc_cmeans_col := hard_label,
+      !!pc_cmeans_membership_col := max_membership
+    )
+
+  cluster_assignments[[pc_cmeans_col]] <- pc_cmeans_membership_tbl[[pc_cmeans_col]]
+
+  pc_cmeans_features <- pc_feature_tbl %>%
+    left_join(
+      pc_cmeans_membership_tbl %>% select(DataZone, all_of(pc_cmeans_col)),
+      by = "DataZone"
+    )
+
+  pc_cmeans_reference_summary <- cmeans_m_diag_pc %>%
+    slice(which.min(abs(m - reference_m_pc))) %>%
+    transmute(
+      `k` = k,
+      `Reference/reporting value m` = m,
+      `Mean max membership` = mean_max_membership,
+      `Prop. max < 0.6` = prop_max_below_main,
+      `Prop. max < 0.7` = prop_max_below_secondary,
+      `ARI to previous m` = ari_to_previous_m,
+      `ARI to K-means` = ari_to_baseline_kmeans,
+      `Silhouette (hard labels)` = silhouette
+    )
+
+  kable(
+    pc_cmeans_reference_summary,
+    digits = 3,
+    caption = "Reference C-means summary for the PC feature set"
+  ) %>%
+    kable_styling(full_width = FALSE)
+
+  kable(
+    count_clusters(pc_cmeans_features[[pc_cmeans_col]]),
+    caption = paste0("Cluster sizes for ", caption_safe(pc_cmeans_col))
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+```
+
+```{r cmeans-pc-boxplot, fig.width=13, fig.height=9}
+if (isTRUE(params$use_cmeans)) {
+  plot_domain_boxplots(
+    pc_cmeans_features,
+    cluster_col = pc_cmeans_col,
+    title_text = paste0("C-means reference solution, PC feature set: ", pc_cmeans_col, " (reference/reporting value m = ", reference_m_pc, ")")
+  )
+}
+```
+
+```{r cmeans-pc-ambiguity-map, fig.width=8, fig.height=6}
+if (isTRUE(params$use_cmeans)) {
+  pc_cmeans_map_sf <- board_sf_complete %>%
+    select(DataZone, geometry) %>%
+    left_join(
+      pc_cmeans_membership_tbl %>% select(DataZone, all_of(pc_cmeans_membership_col)),
+      by = "DataZone"
+    )
+
+  plot_cmeans_ambiguity_map(
+    pc_cmeans_map_sf,
+    membership_col = pc_cmeans_membership_col,
+    title_text = paste0("Most ambiguous areas in the PC C-means solution at the reference/reporting value m = ", reference_m_pc, "")
+  )
+}
+```
+
+### Reference-solution comparison
+
+For this comparison, `k` is fixed at 2 and the **reference/reporting value `m = 2`** is used for both feature sets.
+
+```{r cmeans-comparison}
+if (isTRUE(params$use_cmeans)) {
+  cmeans_comparison_long_tbl <- bind_rows(
+    cmeans_m_diag_raw %>%
+      slice(which.min(abs(m - reference_m_raw))) %>%
+      transmute(
+        feature_set = "Raw",
+        fixed_k = k,
+        reference_reporting_value_m = m,
+        `Mean max membership` = mean_max_membership,
+        `Prop. max < 0.6` = prop_max_below_main,
+        `Prop. max < 0.7` = prop_max_below_secondary,
+        `ARI to previous m` = ari_to_previous_m,
+        `ARI to K-means` = ari_to_baseline_kmeans,
+        `Silhouette (hard labels)` = silhouette
+      ),
+    cmeans_m_diag_pc %>%
+      slice(which.min(abs(m - reference_m_pc))) %>%
+      transmute(
+        feature_set = "PC",
+        fixed_k = k,
+        reference_reporting_value_m = m,
+        `Mean max membership` = mean_max_membership,
+        `Prop. max < 0.6` = prop_max_below_main,
+        `Prop. max < 0.7` = prop_max_below_secondary,
+        `ARI to previous m` = ari_to_previous_m,
+        `ARI to K-means` = ari_to_baseline_kmeans,
+        `Silhouette (hard labels)` = silhouette
+      )
+  ) %>%
+    tidyr::pivot_longer(
+      cols = -c(feature_set, fixed_k, reference_reporting_value_m),
+      names_to = "summary",
+      values_to = "value"
+    ) %>%
+    mutate(
+      summary = factor(
+        summary,
+        levels = c(
+          "Mean max membership",
+          "Prop. max < 0.6",
+          "Prop. max < 0.7",
+          "ARI to previous m",
+          "ARI to K-means",
+          "Silhouette (hard labels)"
+        )
+      )
+    ) %>%
+    arrange(feature_set, summary) %>%
+    select(`Feature set` = feature_set, `k` = fixed_k, `Reference/reporting value m` = reference_reporting_value_m, Summary = summary, Value = value)
+
+  kable(
+    cmeans_comparison_long_tbl,
+    digits = 3,
+    caption = "Reference C-means summary by feature set"
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+
+```
+
+At the reference/reporting value `m = 2`, the PC-based two-cluster solution is sharper, while the raw solution contains more boundary cases.
+
+```{r cmeans-reference-membership-distributions, fig.width=12, fig.height=5.5}
+if (isTRUE(params$use_cmeans)) {
+  p_raw_membership_dist <- plot_cmeans_membership_distribution(
+    raw_cmeans_membership_export,
+    title_text = paste0("Raw solution at the reference/reporting value m = ", reference_m_raw, ""),
+    main_threshold = params$cmeans_main_ambiguity_threshold,
+    secondary_threshold = params$cmeans_secondary_ambiguity_threshold
+  )
+
+  p_pc_membership_dist <- plot_cmeans_membership_distribution(
+    pc_cmeans_membership_export,
+    title_text = paste0("PC solution at the reference/reporting value m = ", reference_m_pc, ""),
+    main_threshold = params$cmeans_main_ambiguity_threshold,
+    secondary_threshold = params$cmeans_secondary_ambiguity_threshold
+  )
+
+  p_raw_membership_dist | p_pc_membership_dist
+}
+```
+
+## Finite mixture models (secondary model-based comparator)
+
+Finite mixture models are kept here as a **secondary model-based comparator**, not as co-equal evidence for the same two-cluster story. In these data, the BIC-preferred component count can differ materially from `k = 2`, so the two-component FMM should be read as a **constrained comparator for consistency**, not as independent support for the headline two-cluster conclusion.
+
+BIC and ICL are therefore the main FMM diagnostics. Silhouette is shown only as a **secondary compactness summary** of the hardened assignments.
+
+### Raw-based clustering
+
+```{r mclust-raw-diagnostics}
+if (isTRUE(params$use_mclust)) {
+  diag_mclust_raw <- method_diagnostics(raw_x, params$k_grid, method = "mclust", seed = params$seed) %>%
+    mutate(feature_set = "raw")
+
+  p_mclust_raw_bic <- plot_diagnostic_curve(
+    diag_mclust_raw,
+    y_col = "BIC",
+    title_text = "Finite mixture model component-count profile",
+    y_lab = "BIC",
+    method_label = "Raw-indicator-based feature set"
+  )
+
+  p_mclust_raw_icl <- plot_diagnostic_curve(
+    diag_mclust_raw,
+    y_col = "ICL",
+    title_text = "Finite mixture model component-count profile",
+    y_lab = "ICL",
+    method_label = "Raw-indicator-based feature set"
+  )
+
+  p_mclust_raw_sil <- plot_diagnostic_curve(
+    diag_mclust_raw,
+    y_col = "silhouette",
+    title_text = "Finite mixture model secondary compactness summary",
+    y_lab = "Average silhouette width",
+    method_label = "Raw-indicator-based feature set"
+  )
+
+  (p_mclust_raw_bic | p_mclust_raw_icl) / p_mclust_raw_sil
+}
+```
+
+```{r mclust-raw-fit}
+if (isTRUE(params$use_mclust)) {
+  raw_mclust_col <- pick_cluster_col("raw", "mclust", selected_k_raw)
+  cluster_assignments[[raw_mclust_col]] <- fit_mclust_labels(raw_x, k = selected_k_raw, seed = params$seed)
+
+  raw_mclust_features <- raw_feature_tbl %>%
+    left_join(cluster_assignments %>% select(DataZone, all_of(raw_mclust_col)), by = "DataZone")
+
+  kable(
+    count_clusters(raw_mclust_features[[raw_mclust_col]]),
+    caption = paste0("Cluster sizes for constrained comparator ", caption_safe(raw_mclust_col))
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+```
+
+```{r mclust-raw-boxplot, fig.width=13, fig.height=9}
+if (isTRUE(params$use_mclust)) {
+  plot_domain_boxplots(
+    raw_mclust_features,
+    cluster_col = raw_mclust_col,
+    title_text = paste0("Finite mixture comparator, raw feature set: ", raw_mclust_col, " (reported at k = ", selected_k_raw, ")")
+  )
+}
+```
+
+### PC-based clustering
+
+```{r mclust-pc-diagnostics}
+if (isTRUE(params$use_mclust)) {
+  diag_mclust_pc <- method_diagnostics(pc_x, params$k_grid, method = "mclust", seed = params$seed) %>%
+    mutate(feature_set = "pc")
+
+  p_mclust_pc_bic <- plot_diagnostic_curve(
+    diag_mclust_pc,
+    y_col = "BIC",
+    title_text = "Finite mixture model component-count profile",
+    y_lab = "BIC",
+    method_label = "PC-based feature set"
+  )
+
+  p_mclust_pc_icl <- plot_diagnostic_curve(
+    diag_mclust_pc,
+    y_col = "ICL",
+    title_text = "Finite mixture model component-count profile",
+    y_lab = "ICL",
+    method_label = "PC-based feature set"
+  )
+
+  p_mclust_pc_sil <- plot_diagnostic_curve(
+    diag_mclust_pc,
+    y_col = "silhouette",
+    title_text = "Finite mixture model secondary compactness summary",
+    y_lab = "Average silhouette width",
+    method_label = "PC-based feature set"
+  )
+
+  (p_mclust_pc_bic | p_mclust_pc_icl) / p_mclust_pc_sil
+}
+```
+
+```{r mclust-pc-fit}
+if (isTRUE(params$use_mclust)) {
+  pc_mclust_col <- pick_cluster_col("pc", "mclust", selected_k_pc)
+  cluster_assignments[[pc_mclust_col]] <- fit_mclust_labels(pc_x, k = selected_k_pc, seed = params$seed)
+
+  pc_mclust_features <- pc_feature_tbl %>%
+    left_join(cluster_assignments %>% select(DataZone, all_of(pc_mclust_col)), by = "DataZone")
+
+  kable(
+    count_clusters(pc_mclust_features[[pc_mclust_col]]),
+    caption = paste0("Cluster sizes for constrained comparator ", caption_safe(pc_mclust_col))
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+```
+
+```{r mclust-pc-boxplot, fig.width=13, fig.height=9}
+if (isTRUE(params$use_mclust)) {
+  plot_domain_boxplots(
+    pc_mclust_features,
+    cluster_col = pc_mclust_col,
+    title_text = paste0("Finite mixture comparator, PC feature set: ", pc_mclust_col, " (reported at k = ", selected_k_pc, ")")
+  )
+}
+```
+
+### Comparator summary
+
+```{r mclust-comparison}
+if (isTRUE(params$use_mclust)) {
+  mclust_comparison_tbl <- tibble(
+    comparison = c("raw", "pc"),
+    reporting_k = c(selected_k_raw, selected_k_pc),
+    best_bic_k = c(
+      best_metric_k(diag_mclust_raw, "BIC", "k"),
+      best_metric_k(diag_mclust_pc, "BIC", "k")
+    ),
+    best_bic = c(
+      best_metric_value(diag_mclust_raw, "BIC"),
+      best_metric_value(diag_mclust_pc, "BIC")
+    ),
+    best_silhouette_k = c(
+      best_metric_k(diag_mclust_raw, "silhouette", "k"),
+      best_metric_k(diag_mclust_pc, "silhouette", "k")
+    ),
+    best_silhouette = c(
+      best_metric_value(diag_mclust_raw, "silhouette"),
+      best_metric_value(diag_mclust_pc, "silhouette")
+    )
+  )
+
+  kable(
+    mclust_comparison_tbl,
+    digits = 3,
+    caption = "Finite mixture comparator summary between raw and PC feature sets"
+  ) %>%
+    kable_styling(full_width = FALSE)
+}
+```
+
+# Comparison of selected clustering results
+
+This final comparison keeps the roles of the methods distinct: **K-means remains the headline partitioning result**, **C-means is an uncertainty overlay**, and **FMM is a secondary model-based comparator**.
+
+## Diagnostic summaries
+
+```{r selected-clustering-results}
+selected_cluster_cols <- c(
+  raw_kmeans_col,
+  pc_kmeans_col,
+  raw_hclust_col,
+  pc_hclust_col
+)
+
+if (isTRUE(params$use_cmeans)) {
+  selected_cluster_cols <- c(selected_cluster_cols, raw_cmeans_col, pc_cmeans_col)
+}
+
+if (isTRUE(params$use_mclust)) {
+  selected_cluster_cols <- c(selected_cluster_cols, raw_mclust_col, pc_mclust_col)
+}
+
+selected_cluster_cols <- unique(selected_cluster_cols)
+```
+
+## Similarity cross-tables
+
+```{r similarity}
+similarity_pairs <- selected_similarity_pairs(selected_cluster_cols)
+
+similarity_tbl <- compute_similarity_table(cluster_assignments, similarity_pairs)
+
+kable(
+  similarity_tbl %>% arrange(desc(ARI), desc(NMI)),
+  digits = 3,
+  caption = "Selected pairwise similarity metrics"
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+The square diagrams below are shown one metric at a time so that the labels and values remain readable in the knitted report.
+
+```{r similarity-matrix-ari, fig.width=8.5, fig.height=7, out.width='88%'}
+plot_similarity_heatmap(
+  similarity_tbl,
+  metric = "ARI",
+  title_text = "ARI"
+)
+```
+
+```{r similarity-matrix-nmi, fig.width=8.5, fig.height=7, out.width='88%'}
+plot_similarity_heatmap(
+  similarity_tbl,
+  metric = "NMI",
+  title_text = "NMI"
+)
+```
+
+```{r similarity-matrix-vi, fig.width=8.5, fig.height=7, out.width='88%'}
+plot_similarity_heatmap(
+  similarity_tbl,
+  metric = "VI",
+  title_text = "VI"
+)
+```
+
+## Primary combined diagnostics for the headline hard-partitioning methods
+
+The combined comparison below is intentionally limited to **K-means** and **hierarchical clustering**, which carry the main hard-partition story. C-means and FMM are summarised in their own sections above; for those methods, silhouette and WSS are secondary diagnostics rather than the basis for the main conclusion.
+
+```{r combined-diagnostics, fig.width=14, fig.height=12}
+all_diagnostics <- dplyr::bind_rows(
+  diag_kmeans_raw %>% dplyr::mutate(feature_set = "raw"),
+  diag_kmeans_pc %>% dplyr::mutate(feature_set = "pc"),
+  diag_hclust_raw %>% dplyr::mutate(feature_set = "raw"),
+  diag_hclust_pc %>% dplyr::mutate(feature_set = "pc")
+)
+
+diag_methods <- all_diagnostics %>%
+  mutate(
+    method_label = dplyr::case_when(
+      method == "kmeans" ~ "K-means",
+      method == "hierarchical" ~ "Hierarchical",
+      TRUE ~ method
+    )
+  )
+
+method_levels <- diag_methods %>%
+  dplyr::distinct(method, method_label) %>%
+  dplyr::mutate(order = dplyr::case_when(
+    method == "kmeans" ~ 1,
+    method == "hierarchical" ~ 2,
+    TRUE ~ 99
+  )) %>%
+  dplyr::arrange(order) %>%
+  dplyr::pull(method_label)
+
+diag_methods <- diag_methods %>%
+  dplyr::mutate(method_label = factor(method_label, levels = method_levels))
+
+plot_combined_diag <- function(data, y_col, title_text, y_lab, selected_k) {
+  ggplot(data, aes(x = k, y = .data[[y_col]], colour = method_label)) +
+    geom_vline(xintercept = selected_k, linetype = "dashed", colour = "grey40") +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2) +
+    annotate(
+      "text",
+      x = selected_k,
+      y = Inf,
+      label = paste0("chosen k = ", selected_k),
+      vjust = 1.5,
+      hjust = -0.05,
+      size = 3.4,
+      colour = "grey30"
+    ) +
+    scale_x_continuous(breaks = params$k_grid) +
+    labs(
+      title = title_text,
+      x = "Number of clusters",
+      y = y_lab,
+      colour = "Method"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+}
+
+p_elbow_raw <- plot_combined_diag(
+  diag_methods %>% dplyr::filter(feature_set == "raw"),
+  y_col = "wss",
+  title_text = "Combined elbow plot: raw-indicator-based feature set",
+  y_lab = "Within-cluster sum of squares",
+  selected_k = selected_k_raw
+)
+
+p_elbow_pc <- plot_combined_diag(
+  diag_methods %>% dplyr::filter(feature_set == "pc"),
+  y_col = "wss",
+  title_text = "Combined elbow plot: PC-based feature set",
+  y_lab = "Within-cluster sum of squares",
+  selected_k = selected_k_pc
+)
+
+p_sil_raw <- plot_combined_diag(
+  diag_methods %>% dplyr::filter(feature_set == "raw"),
+  y_col = "silhouette",
+  title_text = "Combined silhouette plot: raw-indicator-based feature set",
+  y_lab = "Average silhouette width",
+  selected_k = selected_k_raw
+)
+
+p_sil_pc <- plot_combined_diag(
+  diag_methods %>% dplyr::filter(feature_set == "pc"),
+  y_col = "silhouette",
+  title_text = "Combined silhouette plot: PC-based feature set",
+  y_lab = "Average silhouette width",
+  selected_k = selected_k_pc
+)
+
+((p_elbow_raw | p_elbow_pc) / (p_sil_raw | p_sil_pc)) +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+```
+
+
+## External anchoring to overall SIMD rank
+
+The two-panel figure below anchors the selected cluster solution back to overall SIMD position.
+Panel (a) shows whether the selected clusters track overall deprivation rank.
+Panel (b) uses a tightened five-indicator set and shows 95% confidence intervals around within-tertile cluster means, so that differences within broad overall-rank bands read more clearly as evidence rather than as an exploratory diagnostic.
+
+```{r rank-anchor-panels, fig.width=12, fig.height=10.5, out.width='95%'}
+headline_cluster_col <- raw_kmeans_col
+rank_band_n <- 3L
+rank_band_prefix <- "T"
+rank_band_name_plural <- "tertiles"
+
+if (is.null(overall_rank_source_col)) {
+  cat("Overall SIMD rank column was not detected in the joined source data, so the external anchoring figure was skipped.")
+} else if (!headline_cluster_col %in% names(cluster_assignments)) {
+  stop(
+    paste0(
+      "The selected headline cluster column '", headline_cluster_col,
+      "' was not found in cluster_assignments."
+    ),
+    call. = FALSE
+  )
+} else {
+  indicator_label_map <- c(
+    income_rate = "Income rate",
+    employment_rate = "Employment rate",
+    CIF = "CIF",
+    no_qualifications = "No qualifications",
+    DRUG = "DRUG"
+  )
+
+  requested_key_vars <- c(
+    "income_rate",
+    "employment_rate",
+    "CIF",
+    "no_qualifications",
+    "DRUG"
+  )
+
+  missing_key_vars <- setdiff(requested_key_vars, names(board_complete))
+  if (length(missing_key_vars) > 0) {
+    stop(
+      paste0(
+        "The following requested panel (b) indicators were not found in board_complete: ",
+        paste(missing_key_vars, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+
+  key_vars <- requested_key_vars
+
+  rank_plot_df <- cluster_assignments %>%
+    select(DataZone, cluster = all_of(headline_cluster_col)) %>%
+    left_join(board_meta, by = "DataZone") %>%
+    left_join(board_complete %>% select(DataZone, all_of(key_vars)), by = "DataZone") %>%
+    filter(!is.na(overall_simd_rank)) %>%
+    mutate(
+      cluster = factor(cluster),
+      overall_rank_band_num = dplyr::ntile(overall_simd_rank, rank_band_n),
+      overall_rank_band = factor(
+        overall_rank_band_num,
+        levels = seq_len(rank_band_n),
+        labels = paste0(rank_band_prefix, seq_len(rank_band_n))
+      )
+    )
+
+  cluster_summary <- rank_plot_df %>%
+    group_by(cluster) %>%
+    summarise(median_rank = median(overall_simd_rank, na.rm = TRUE), .groups = "drop") %>%
+    arrange(median_rank)
+
+  cluster_levels_original <- levels(rank_plot_df$cluster)
+  cluster_display_map <- setNames(
+    paste0("Cluster ", cluster_levels_original),
+    cluster_levels_original
+  )
+
+  if (length(cluster_levels_original) == 2L) {
+    cluster_display_map[as.character(cluster_summary$cluster[1])] <- paste0(
+      "Cluster ", cluster_summary$cluster[1], " (more deprived)"
+    )
+    cluster_display_map[as.character(cluster_summary$cluster[2])] <- paste0(
+      "Cluster ", cluster_summary$cluster[2], " (less deprived)"
+    )
+  }
+
+  cluster_display_levels <- unname(cluster_display_map[cluster_levels_original])
+  cluster_palette_display <- setNames(
+    cluster_palette[cluster_levels_original],
+    cluster_display_levels
+  )
+
+  rank_plot_df <- rank_plot_df %>%
+    mutate(
+      cluster_display = factor(
+        cluster_display_map[as.character(cluster)],
+        levels = cluster_display_levels
+      )
+    )
+
+  k_selected <- nlevels(rank_plot_df$cluster_display)
+  max_rank_value <- max(rank_plot_df$overall_simd_rank, na.rm = TRUE)
+
+  rank_breaks <- pretty(c(1, max_rank_value))
+  rank_breaks <- rank_breaks[rank_breaks >= 1 & rank_breaks <= max_rank_value]
+
+  p_rank <- ggplot(
+    rank_plot_df,
+    aes(x = cluster_display, y = overall_simd_rank, fill = cluster_display)
+  ) +
+    geom_violin(alpha = 0.25, width = 0.9, colour = NA, show.legend = FALSE) +
+    geom_boxplot(width = 0.18, outlier.alpha = 0.20, show.legend = FALSE) +
+    scale_fill_manual(values = cluster_palette_display, drop = FALSE, guide = "none") +
+    scale_y_reverse(
+      limits = c(max_rank_value, 1),
+      breaks = rank_breaks,
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    labs(
+      title = "Overall SIMD rank by cluster",
+      subtitle = paste0(
+        params$target_board,
+        " | selected raw-indicator k-means partition (k = ",
+        k_selected,
+        ")"
+      ),
+      x = NULL,
+      y = "Overall SIMD rank (1 = most deprived)",
+      fill = "Cluster"
+    ) +
+    theme_minimal(base_size = 12) +
+    guides(fill = "none", colour = "none") +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(face = "bold"),
+      legend.position = "none"
+    )
+
+  panel_b_df <- rank_plot_df %>%
+    select(DataZone, cluster_display, overall_rank_band, all_of(key_vars)) %>%
+    pivot_longer(
+      cols = all_of(key_vars),
+      names_to = "indicator",
+      values_to = "value"
+    ) %>%
+    group_by(overall_rank_band, cluster_display, indicator) %>%
+    summarise(
+      n = sum(!is.na(value)),
+      mean_value = mean(value, na.rm = TRUE),
+      sd_value = sd(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      se_value = dplyr::if_else(n > 1, sd_value / sqrt(n), NA_real_),
+      t_crit = dplyr::if_else(n > 1, qt(0.975, df = pmax(n - 1, 1)), NA_real_),
+      ci_half = se_value * t_crit,
+      ymin = mean_value - ci_half,
+      ymax = mean_value + ci_half,
+      indicator = factor(
+        indicator,
+        levels = key_vars,
+        labels = unname(indicator_label_map[key_vars])
+      )
+    )
+
+  panel_caption <- paste0(
+    "Relationship between selected cluster membership and overall SIMD rank in ",
+    params$target_board,
+    ". Panel (a) shows the distribution of overall SIMD rank by cluster for the selected raw-indicator k-means partition (k = ",
+    k_selected,
+    "). Lower rank values indicate greater deprivation. Panel (b) shows mean indicator values by cluster within broad overall SIMD rank tertiles. ",
+    "Error bars indicate 95% confidence intervals. Cluster-by-tertile representation is uneven, especially at the extremes, so those comparisons should be interpreted cautiously."
+  )
+
+  knitr::opts_current$set(fig.cap = panel_caption)
+
+  p_band <- ggplot(
+    panel_b_df,
+    aes(x = overall_rank_band, y = mean_value, colour = cluster_display, group = cluster_display)
+  ) +
+    geom_errorbar(
+      aes(ymin = ymin, ymax = ymax),
+      width = 0.08,
+      alpha = 0.6,
+      linewidth = 0.65,
+      na.rm = TRUE,
+      show.legend = FALSE
+    ) +
+    geom_line(linewidth = 0.8, show.legend = TRUE) +
+    geom_point(size = 2, show.legend = FALSE) +
+    facet_wrap(~ indicator, scales = "free_y", ncol = 2) +
+    scale_colour_manual(values = cluster_palette_display, drop = FALSE, name = "Cluster") +
+    labs(
+      title = "Domain composition within broad overall-rank bands",
+      subtitle = paste0(
+        toupper(substr(rank_band_name_plural, 1, 1)),
+        substr(rank_band_name_plural, 2, nchar(rank_band_name_plural)),
+        " of overall SIMD rank within ", params$target_board,
+        " (T1 = most deprived)"
+      ),
+      x = "Overall SIMD rank band",
+      y = "Mean indicator value",
+      colour = "Cluster"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold")
+    )
+
+  wrap_plots(p_rank, p_band, ncol = 1, heights = c(1, 1.55), guides = "collect") +
+    plot_annotation(
+      title = paste0(
+        "Relationship between selected cluster membership and overall SIMD rank in ",
+        params$target_board
+      ),
+      tag_levels = "a"
+    ) &
+    theme(legend.position = "bottom")
+}
+```
+
+## Maps for selected clustering results
+
+```{r maps, fig.width=13, fig.height=10}
+map_sf <- board_sf_complete %>%
+  left_join(cluster_assignments, by = "DataZone")
+
+map_cols <- selected_cluster_cols[grepl("_k[0-9]+$", selected_cluster_cols)]
+
+map_list <- purrr::map(
+  map_cols,
+  ~ plot_cluster_map(map_sf, .x, title_text = .x)
+)
+
+wrap_plots(map_list, ncol = 2) +
+  plot_annotation(title = "Maps for selected clustering results")
+```
+
+## Difference maps
+
+```{r difference-maps, fig.width=13, fig.height=10}
+difference_plot_list <- list(
+  plot_difference_map(map_sf, raw_kmeans_col, raw_hclust_col, "Raw: K-means vs hierarchical"),
+  plot_difference_map(map_sf, pc_kmeans_col, pc_hclust_col, "PC: K-means vs hierarchical"),
+  plot_difference_map(map_sf, raw_kmeans_col, pc_kmeans_col, "K-means: raw vs PC"),
+  plot_difference_map(map_sf, raw_hclust_col, pc_hclust_col, "Hierarchical: raw vs PC")
+)
+
+if (isTRUE(params$use_cmeans)) {
+  difference_plot_list <- c(
+    difference_plot_list,
+    list(
+      plot_difference_map(map_sf, raw_cmeans_col, pc_cmeans_col, "C-means: raw vs PC")
+    )
+  )
+}
+
+if (isTRUE(params$use_mclust)) {
+  difference_plot_list <- c(
+    difference_plot_list,
+    list(
+      plot_difference_map(map_sf, raw_mclust_col, pc_mclust_col, "Finite mixture model: raw vs PC")
+    )
+  )
+}
+
+wrap_plots(difference_plot_list, ncol = 2) +
+  plot_annotation(title = "Difference maps for selected clustering comparisons")
+```
+
+# Outputs passed to the vine document
+
+```{r export-vine-inputs}
+dir.create(params$output_dir, showWarnings = FALSE, recursive = TRUE)
+
+readr::write_csv(board_complete, file.path(params$output_dir, paste0(output_prefix, "_analysis_base.csv")))
+readr::write_csv(raw_feature_tbl, file.path(params$output_dir, paste0(output_prefix, "_feature_set_raw.csv")))
+readr::write_csv(pc_feature_tbl, file.path(params$output_dir, paste0(output_prefix, "_feature_set_pc.csv")))
+readr::write_csv(cluster_assignments, file.path(params$output_dir, paste0(output_prefix, "_cluster_assignments.csv")))
+
+if (isTRUE(params$use_cmeans)) {
+  readr::write_csv(
+    raw_cmeans_membership_export,
+    file.path(params$output_dir, paste0(output_prefix, "_cmeans_memberships_raw.csv"))
+  )
+  readr::write_csv(
+    pc_cmeans_membership_export,
+    file.path(params$output_dir, paste0(output_prefix, "_cmeans_memberships_pc.csv"))
+  )
+}
+```
+
+The next document should read:
+
+- `r paste0(output_prefix, "_analysis_base.csv")`
+- `r paste0(output_prefix, "_feature_set_raw.csv")`
+- `r paste0(output_prefix, "_feature_set_pc.csv")`
+- `r paste0(output_prefix, "_cluster_assignments.csv")`
+
+If a reference C-means solution is carried forward as an uncertainty-aware comparator, it should also read:
+
+- `r paste0(output_prefix, "_cmeans_memberships_raw.csv")`
+- `r paste0(output_prefix, "_cmeans_memberships_pc.csv")`
+
+These C-means membership files contain:
+
+- `DataZone`
+- `cluster_1_membership`
+- `cluster_2_membership`
+- `max_membership`
+- `hard_label`
+- `core_borderline_flag`
+
+The chosen clustering result for vine fitting is then selected by its column name, for example:
+
+- `raw_kmeans_k2`
+- `pc_hclust_k2`
+- `raw_cmeans_k2`
+- `pc_mclust_k2`
+
+A useful next-stage sensitivity check is to fit vines on **all members** first and then refit on a stricter **core-only subset** defined from `max_membership` (for example `r paste0(">= ", params$vine_core_membership_threshold)`) for the reference C-means solution. The updated vine document supports this directly through optional C-means membership inputs and a core-membership threshold parameter.
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

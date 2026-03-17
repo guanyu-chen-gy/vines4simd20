@@ -90,7 +90,7 @@ simd_domains <- simd_joined %>%
                          "Crime", "Housing")
   )
 
-ggplot(simd_domains) +
+p_rank <- ggplot(simd_domains) +
   geom_sf(aes(fill = Rank), colour = NA) +
   scale_fill_viridis_c(option = "plasma", direction = -1,
                        name = "Deprivation Rank") +
@@ -105,11 +105,19 @@ ggplot(simd_domains) +
     strip.text = element_text(size = 12, face = "bold")
   ) +
   labs(
-    title = "SIMD 2020v2 Domain Deprivation Ranks Across Scotland",
+    title = "SIMD 2020 Domain Deprivation Ranks Across Scotland",
     subtitle = "1 = Most Deprived, 6,976 = Least Deprived",
     caption = "Source: Scottish Government (SIMD 2020v2)"
   )
 
+ggsave(
+  "figures/simd_domain_ranks.png",
+  plot = p_rank,
+  width = 11,
+  height = 8.5,
+  units = "in",
+  dpi = 300
+)
 ```
 
 ## Descriptive statistics for all indicators
@@ -152,6 +160,12 @@ stats_table <- stats_table %>%
   mutate(z_test = ifelse(p_value < 0.0001, "<0.0001", sprintf("%.4f", p_value)))
 
 kable(stats_table, caption = "Descriptive Statistics and Normality Tests for SIMD Indicators")
+
+library(kableExtra)
+tab <- kbl(stats_table, caption = "Descriptive Statistics and Normality Tests for SIMD Indicators") %>%
+  kable_styling(full_width = FALSE)
+
+save_kable(tab, "stats_table.png")
 ```
 
 ```{r density-plots-for-all, fig.width= 10, fig.height=12,, dpi=300, echo = FALSE, warning=FALSE}
@@ -235,7 +249,7 @@ domain_colors <- c(
   "Housing"     = "#8c564b"   # brown
 )
 
-ggplot(simd_long, aes(x = Value, fill = Domain, color = Domain)) +
+p_dist <- ggplot(simd_long, aes(x = Value, fill = Domain, color = Domain)) +
   geom_density(linewidth = 0.8, alpha = 0.9) +
   facet_wrap(~ Indicator, scales = "free", ncol = 4) +
   scale_fill_manual(values = domain_colors, name = "Domain") +
@@ -253,10 +267,20 @@ ggplot(simd_long, aes(x = Value, fill = Domain, color = Domain)) +
    plot.subtitle = element_text(size = 14, hjust = 0.5)
 ) +
   labs(
-    title = "Distribution of SIMD 2020v2 Indicators",
+    title = "Distribution of SIMD 2020 Indicators",
     subtitle = "Indicators grouped sequentially by domain, with domain-specific colours",
     caption = "Source: Scottish Government (SIMD 2020v2)"
   )
+
+ggsave(
+  "figures/simd_indicator_distributions.png",
+  plot = p_dist,
+  width = 11,
+  height = 8.5,
+  units = "in",
+  dpi = 300
+)
+
 ```
 
 # Joint board area
@@ -302,11 +326,11 @@ joint_board_lookup <- tribble(
 simd_joined <- simd_joined %>%
   left_join(joint_board_lookup, by = c("Council_area" = "Council_area"))
 
-# joint_board_counts <- simd_joined %>%
-#   st_drop_geometry() %>%
-#   group_by(Joint_Board_area) %>%
-#   summarise(n_datazones = n())
-# 
+joint_board_counts <- simd_joined %>%
+  st_drop_geometry() %>%
+  group_by(Joint_Board_area) %>%
+  summarise(n_datazones = n())
+
 # # --- Step 2. Build centroids safely (handle invalid geometry) ---
 # joint_board_centroids <- simd_joined %>%
 #   mutate(geometry = st_make_valid(geometry)) %>%
@@ -329,7 +353,7 @@ simd_joined <- simd_joined %>%
 #   bind_cols(st_drop_geometry(joint_board_centroids_4326))
 # 
 # # --- Step 6. Plot the map ---
-# ggplot(simd_joined_4326) +
+# p_jba <- ggplot(simd_joined_4326) +
 #   geom_sf(aes(fill = legend_label), color = NA) +
 # 
 #   geom_text_repel(
@@ -349,7 +373,7 @@ simd_joined <- simd_joined %>%
 #   # Legend now only shows area names
 #   scale_fill_viridis_d(option = "turbo", name = "Joint Board Area") +
 # 
-#   guides(fill = guide_legend(nrow = 4, byrow = TRUE)) +  # neatly wrap legend
+#   guides(fill = guide_legend(ncol = 1)) +  # neatly wrap legend
 #   coord_sf() +
 #   theme_minimal() +
 #   labs(
@@ -358,15 +382,23 @@ simd_joined <- simd_joined %>%
 #   theme(
 #     plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
 #     plot.subtitle = element_text(size = 11, hjust = 0.5),
-#     legend.position = "bottom",
-#     legend.box = "horizontal",
+#     legend.position = "right",
+#     legend.box = "vertical",
 #     legend.title = element_text(size = 10, face = "bold"),
 #     legend.text = element_text(size = 9),
-#     plot.margin = margin(10, 10, 50, 10)
+#     plot.margin = margin(10, 10, 10, 10)
 #   )
 # 
-# 
-# ```
+# ggsave(
+#   "figures/joint_board_area.png",
+#   plot = p_jba,
+#   width = 11,
+#   height = 8.5,
+#   units = "in",
+#   dpi = 300
+# )
+# p_jba
+```
 # 
 # # Lothian and Glasgow
 # 
